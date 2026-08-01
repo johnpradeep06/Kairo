@@ -1,0 +1,200 @@
+@import "tailwindcss";
+
+:root {
+    /* Light Theme Semantic Tokens — warm/editorial "paper" palette imported
+       from the Claude Design project "Kairo Chat" (Kairo Chat.dc.html). */
+    --bg-primary: #f7f5f0;
+    --bg-secondary: #fffefb;
+    --bg-tertiary: #f2efe8;
+    --text-primary: #26241f;
+    --text-secondary: #706b60;
+    --text-tertiary: #9c968a;
+    --border-default: #e7e3d9;
+    --border-strong: #ddd8cb;
+    --card-background: #fffefb;
+    --input-background: #f2efe8;
+    --button-primary: oklch(0.68 0.12 85);
+    /* Solid, bordered secondary buttons per the design — not a translucent
+       overlay. Every "bg-button-secondary border border-border-default"
+       button in the app inherits this without a component-level change. */
+    --button-secondary: #fffefb;
+    --scrollbar-thumb: #ddd8cb;
+    --scrollbar-thumb-hover: #cdc7b8;
+
+    /* Accent — warm gold/amber, from the imported design. Kept at its bright
+       source lightness (0.68) because it's a FILL color: --accent-ink text on
+       top of it measures 5.35:1. Measured directly (rasterized via canvas,
+       not estimated) against --bg-primary on its own it's only 2.66:1 — too
+       low for standalone text/icon use, hence --accent-text below. */
+    --accent: oklch(0.68 0.12 85);
+    /* Every remaining use of --accent-strong is now a hover-fill paired with
+       --accent-ink text (File Ticket, Send, Submit Ticket buttons) — not
+       standalone text (that moved to --accent-text below). The design's
+       original 0.6 measured only 3.87:1 under --accent-ink, enough for an
+       icon but not the "File Ticket" text label sharing the same class.
+       0.64 clears 4.58:1 while still reading as a hover-darken step. */
+    --accent-strong: oklch(0.64 0.13 85);
+    --accent-soft: oklch(0.93 0.05 90);
+    --accent-softer: oklch(0.89 0.06 90);
+    --accent-line: oklch(0.8 0.08 88);
+    /* Text painted on a filled --accent surface (buttons, send button) — near
+       black reads far better on this gold than white does. */
+    --accent-ink: #26241f;
+    /* Same hue, darkened for icons/links/labels standing directly on
+       --bg-primary or --card-background (not inside an --accent fill).
+       6.29:1 measured — --accent itself fails even the 3:1 non-text minimum
+       there. Do not use this as a button background: ink-on-this pairing
+       drops to ~2.3:1 (verified) since both sit on the same side of mid-gray. */
+    --accent-text: oklch(0.47 0.13 85);
+
+    /* Darkened from the source's oklch(0.58 0.11 155) — that measured 3.74:1
+       on --bg-primary as the confidence-badge text color, under the 4.5:1
+       minimum. No fill/ink pairing depends on --good, so it was safe to just
+       darken directly. */
+    --good: oklch(0.5 0.11 155);
+    --good-soft: oklch(0.95 0.04 155);
+
+    /* Surface for the user's own message bubble */
+    --user-bubble: #edeae1;
+
+    --shadow-card: 0 1px 2px rgba(40, 36, 28, 0.04), 0 8px 24px -12px rgba(40, 36, 28, 0.12);
+}
+
+.dark {
+    /* Dark Theme Semantic Tokens — same source palette, dark variant. */
+    --bg-primary: #1c1b18;
+    --bg-secondary: #262521;
+    --bg-tertiary: #201f1c;
+    --text-primary: #edeae2;
+    --text-secondary: #a6a094;
+    --text-tertiary: #766f61;
+    --border-default: #34322c;
+    --border-strong: #3f3c34;
+    --card-background: #262521;
+    --input-background: #201f1c;
+    --button-primary: oklch(0.75 0.12 88);
+    --button-secondary: #262521;
+    --scrollbar-thumb: #3f3c34;
+    --scrollbar-thumb-hover: #4c4840;
+
+    /* Lighter accent in dark mode so text on dark stays above 4.5:1. Measured:
+       accent 7.71:1, accent-strong 9.84:1, good 7.27:1 — all comfortable, no
+       darkening needed here the way light mode required. */
+    --accent: oklch(0.75 0.12 88);
+    --accent-strong: oklch(0.82 0.11 88);
+    --accent-soft: oklch(0.34 0.06 88);
+    --accent-softer: oklch(0.4 0.07 88);
+    --accent-line: oklch(0.48 0.08 88);
+    --accent-ink: #1c1b18;
+    /* Already light-on-dark and passing; same value as --accent-strong. */
+    --accent-text: oklch(0.82 0.11 88);
+
+    --good: oklch(0.72 0.1 158);
+    --good-soft: oklch(0.3 0.05 158);
+
+    --user-bubble: #302e28;
+
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.2), 0 10px 30px -14px rgba(0, 0, 0, 0.5);
+}
+
+@theme inline {
+    --color-bg-primary: var(--bg-primary);
+    --color-bg-secondary: var(--bg-secondary);
+    --color-bg-tertiary: var(--bg-tertiary);
+    --color-text-primary: var(--text-primary);
+    --color-text-secondary: var(--text-secondary);
+    --color-text-tertiary: var(--text-tertiary);
+    --color-border-default: var(--border-default);
+    --color-border-strong: var(--border-strong);
+    --color-card-background: var(--card-background);
+    --color-input-background: var(--input-background);
+    --color-button-primary: var(--button-primary);
+    --color-button-secondary: var(--button-secondary);
+
+    --color-accent: var(--accent);
+    --color-accent-strong: var(--accent-strong);
+    --color-accent-soft: var(--accent-soft);
+    --color-accent-softer: var(--accent-softer);
+    --color-accent-line: var(--accent-line);
+    --color-accent-ink: var(--accent-ink);
+    --color-accent-text: var(--accent-text);
+    --color-good: var(--good);
+    --color-good-soft: var(--good-soft);
+    --color-user-bubble: var(--user-bubble);
+
+    --color-background: var(--bg-primary);
+    --color-foreground: var(--text-primary);
+
+    /* UI chrome (nav, buttons, labels, citations) stays sans; the assistant
+       answer body opts into --font-serif explicitly via .prose-answer. */
+    --font-sans: var(--font-hanken-grotesk);
+    --font-serif: var(--font-newsreader);
+    --font-mono: var(--font-geist-mono);
+}
+
+body {
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-hanken-grotesk), ui-sans-serif, system-ui, -apple-system,
+        "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+/* Editorial serif treatment for the assistant's answer prose — the design's
+   one deliberately distinct typographic choice. Citation chips and code
+   inside it opt back into sans/mono explicitly (see ChatInterface.tsx). */
+.prose-answer {
+    font-family: var(--font-newsreader), Georgia, serif;
+}
+
+/* Briefly ring a source card when its inline [n] marker is clicked. */
+@keyframes citation-pulse {
+    0%   { box-shadow: 0 0 0 0 var(--accent-softer); }
+    40%  { box-shadow: 0 0 0 4px var(--accent-softer); }
+    100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); }
+}
+
+.citation-active {
+    animation: citation-pulse 1.6s ease-out;
+    border-color: var(--accent-line) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+
+/* Custom Scrollbar for Webkit */
+.custom-scrollbar::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+    background-color: var(--scrollbar-thumb);
+    border-radius: 4px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background-color: var(--scrollbar-thumb-hover);
+}
+
+/* For Firefox */
+.custom-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) transparent;
+}
