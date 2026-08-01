@@ -146,6 +146,16 @@ class Neo4jGraphRepository:
     def upsert_extraction_result(self, result: ExtractionResult) -> Tuple[int, int]:
         """Save extracted entities & relationships to Neo4j or SQLite persistent store."""
         self._clear_caches()
+        
+        print(f"Total entities extracted: {len(result.entities)}")
+        print(f"Total relationships extracted: {len(result.relationships)}")
+        print("First 100 entity names:")
+        for idx, ent in enumerate(result.entities[:100]):
+            print(f"  {idx + 1}. {ent.canonical_name} ({ent.entity_type.value})")
+        print("First 100 relationships:")
+        for idx, rel in enumerate(result.relationships[:100]):
+            print(f"  {idx + 1}. {rel.source} --{rel.relation.value}--> {rel.target}")
+
         if self.use_fallback or not self.driver:
             return self._fallback_upsert(result)
 
@@ -181,10 +191,13 @@ class Neo4jGraphRepository:
                                 source_text=src_text)
                     nodes_count += 1
 
+                from uuid import uuid4
                 for rel in result.relationships:
                     cypher_rel = """
-                    MATCH (a:Entity {canonical_name: $source})
-                    MATCH (b:Entity {canonical_name: $target})
+                    MERGE (a:Entity {canonical_name: $source})
+                    ON CREATE SET a.id = $source_uuid, a.entity_type = 'Requirement', a.aliases = []
+                    MERGE (b:Entity {canonical_name: $target})
+                    ON CREATE SET b.id = $target_uuid, b.entity_type = 'Requirement', b.aliases = []
                     MERGE (a)-[r:COMPLIANCE_REL {type: $relation}]->(b)
                     ON CREATE SET r.confidence = $confidence, r.extraction_method = $method, r.document_id = $doc_id
                     """
@@ -192,6 +205,8 @@ class Neo4jGraphRepository:
                     session.run(cypher_rel,
                                 source=rel.source,
                                 target=rel.target,
+                                source_uuid=str(uuid4()),
+                                target_uuid=str(uuid4()),
                                 relation=rel.relation.value,
                                 confidence=rel.confidence,
                                 method=rel.extraction_method,
@@ -522,10 +537,35 @@ class Neo4jGraphRepository:
 
     def local_match_entities(self, query: str) -> List[Dict[str, Any]]:
         """Perform query normalization and local node/alias fuzzy & exact matching without LLM calls."""
+        if query in self._entity_match_cache:
+            return self._entity_match_cache[query]
+
         import re
         norm_query = query.lower().strip()
         norm_query = re.sub(r'[^\w\s-]', '', norm_query)
+        
+        plural_map = {
+            "regulations": "regulation",
+            "policies": "policy",
+            "requirements": "requirement",
+            "controls": "control",
+            "risks": "risk",
+            "vendors": "vendor",
+            "departments": "department",
+            "employees": "employee",
+            "assets": "asset",
+            "systems": "system",
+            "procedures": "procedure",
+            "audits": "audit",
+            "evidence": "evidence",
+            "documents": "document",
+            "databases": "database",
+            "servers": "server",
+            "applications": "application"
+        }
         words = norm_query.split()
+        normalized_words = [plural_map.get(w, w) for w in words]
+        norm_query = " ".join(normalized_words)
         
         entities_list = []
         if self.use_fallback or not self.driver:
@@ -619,7 +659,9 @@ class Neo4jGraphRepository:
             if name not in unique_matches or m["confidence"] > unique_matches[name]["confidence"]:
                 unique_matches[name] = m
                 
-        return list(unique_matches.values())
+        res_list = list(unique_matches.values())
+        self._entity_match_cache[query] = res_list
+        return res_list
 
     def delete_document_graph(self, document_id: Union[str, int]) -> int:
         """Remove all relationships and orphan nodes associated with a document ID."""

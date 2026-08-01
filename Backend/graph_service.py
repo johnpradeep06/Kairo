@@ -11,6 +11,7 @@ and Graph RAG query context synthesis.
 import os
 import logging
 import threading
+import dataclasses
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Union, Optional
 
@@ -238,6 +239,8 @@ Answer the User Question using only the provided compliance facts from the Knowl
 Answer:"""
 
         # 5. Single LLM Call (Inference)
+        import time
+        start_llm_time = time.time()
         from rag_pipeline import llm
         try:
             from langchain_core.prompts import PromptTemplate
@@ -247,10 +250,14 @@ Answer:"""
         except Exception as err:
             logger.error("[graph_service] Redesigned Graph RAG LLM call failed: %s", err)
             answer = "No supporting evidence found in uploaded documents due to service unavailability."
+        llm_latency = round(time.time() - start_llm_time, 2)
 
         # Compile dynamic confidence score
         num_nodes = len(subgraph.nodes)
         num_edges = len(subgraph.edges)
+        seed_coverage = 0.0
+        density_factor = 0.0
+        avg_rel_confidence = 0.0
         if num_nodes == 0:
             dyn_confidence = 0.0
         else:
@@ -281,18 +288,30 @@ Answer:"""
             if "matched_by" in m and m["matched_by"].startswith("alias:"):
                 matched_aliases.append(m["matched_by"].replace("alias: ", ""))
 
+        confidence_breakdown = (
+            f"Seed Coverage: {(seed_coverage * 100):.1f}%, "
+            f"Density Factor: {(density_factor * 100):.1f}%, "
+            f"Avg Rel Conf: {(avg_rel_confidence * 100):.1f}%"
+        )
+
         debug_info = {
-            "user_query": question,
             "normalized_query": norm_query,
-            "matched_entities": [m["canonical_name"] for m in matched_entities],
             "matched_aliases": matched_aliases,
+            "canonical_entities": [m["canonical_name"] for m in matched_entities],
             "seed_nodes": seeds,
-            "traversal_depth": depth,
-            "traversed_nodes": [n.label for n in subgraph.nodes] if subgraph else [],
-            "traversed_relationships": [f"{e.source} --[{e.relation}]--> {e.target}" for e in subgraph.edges] if subgraph else [],
-            "supporting_chunks": [c.model_dump() for c in citations],
+            "traversal_order": seeds + [n.label for n in subgraph.nodes if n.label not in seeds] if subgraph else [],
+            "hop_count": depth,
+            "visited_nodes": [n.label for n in subgraph.nodes] if subgraph else [],
+            "visited_relationships": [f"{e.source} --[{e.relation}]--> {e.target}" for e in subgraph.edges] if subgraph else [],
+            "retrieved_chunk_ids": list(set([n.chunk_id for n in subgraph.nodes if n.chunk_id])) if subgraph else [],
+            "retrieved_documents": list(set([n.document_id for n in subgraph.nodes if n.document_id])) if subgraph else [],
             "prompt_length": len(hybrid_prompt),
-            "final_llm_request": hybrid_prompt
+            "llm_latency": f"{llm_latency:.2f}s",
+            "confidence_breakdown": confidence_breakdown,
+            "number_of_openrouter_calls": 1,
+            "user_query": question,
+            "final_llm_request": hybrid_prompt,
+            "supporting_chunks": [dataclasses.asdict(c) for c in citations]
         }
 
         return GraphRAGResponse(
