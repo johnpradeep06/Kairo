@@ -33,6 +33,7 @@ from rag_pipeline import (
     generate_follow_ups, run_agentic_rag_stream, describe_llm_failure,
 )
 from multi_agent_pipeline import run_multi_agent_pipeline_stream
+from graph_router import router as graph_router
 
 # Create Tables, then patch in any newly added columns on existing DBs
 Base.metadata.create_all(bind=engine)
@@ -64,6 +65,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(graph_router)
 
 @app.options("/{full_path:path}")
 async def options_route(full_path: str):
@@ -408,40 +411,62 @@ def backfill_documents() -> None:
         db.close()
 
 
-def _do_ingest(doc_id: int, file_location: str) -> None:
-    """Background ingestion. Runs outside the request so large PDFs no longer
-    hold the HTTP connection open until they time out."""
-    db = SessionLocal()
+def update_doc_status(db: Session, doc_id: int, status: str, *, error_detail: str | None = None, chunk_count: int | None = None):
+    """Safely update Document status, committing changes so UI polling sees state transitions."""
     try:
         doc = db.query(Document).filter(Document.id == doc_id).first()
-        if not doc:
-            return
+        if doc:
+            doc.status = status
+            if error_detail is not None:
+                doc.error_detail = error_detail
+            if chunk_count is not None:
+                doc.chunk_count = chunk_count
+            if status == "indexed":
+                doc.indexed_at = datetime.utcnow()
+            db.commit()
+            logger.info("[ingest-stage] Doc %d -> STATUS: %s", doc_id, status)
+    except Exception as err:
+        db.rollback()
+        logger.error("[ingest-stage] Could not update status %s for doc %d: %s", status, doc_id, err)
 
-        doc.status = "processing"
-        db.commit()
 
+def _do_ingest(doc_id: int, file_location: str) -> None:
+    """Background ingestion with strict state transitions and progress logging:
+    UPLOADED -> PARSING -> EXTRACTING -> GRAPH_BUILDING -> INDEXING -> INDEXED (or FAILED)
+    """
+    db = SessionLocal()
+    try:
+        logger.info("[ingest 1/5] UPLOADED — Starting background ingestion for doc %d", doc_id)
+        update_doc_status(db, doc_id, "PARSING")
+
+        # Stage 2 & 3: PARSING & EXTRACTING (Vector Store Chunks)
+        logger.info("[ingest 2/5] PARSING & EXTRACTING — Generating vector embeddings...")
+        update_doc_status(db, doc_id, "EXTRACTING")
         chunk_count = ingest_document(file_location, doc_id=doc_id)
 
-        doc.chunk_count = chunk_count
-        doc.status = "indexed"
-        doc.indexed_at = datetime.utcnow()
-        doc.error_detail = None
-        db.commit()
-        logger.info("[ingest] %s indexed — %d chunks", doc.filename, chunk_count)
-    except Exception as e:
-        logger.error("[ingest] failed for doc %s: %s", doc_id, e)
+        # Stage 4: GRAPH_BUILDING (Entity Resolution & Knowledge Graph Synthesis)
+        update_doc_status(db, doc_id, "GRAPH_BUILDING")
+        logger.info("[ingest 3/5] GRAPH_BUILDING — Extracting compliance entities & building Neo4j graph...")
         try:
-            doc = db.query(Document).filter(Document.id == doc_id).first()
-            if doc:
-                doc.status = "error"
-                doc.error_detail = str(e)[:1000]
-                db.commit()
-                # Remove the orphan file so it can be re-uploaded cleanly
-                if os.path.exists(file_location):
-                    os.remove(file_location)
-        except Exception as inner:
-            db.rollback()
-            logger.error("[ingest] could not record failure: %s", inner)
+            from graph_service import graph_service
+            graph_service.process_document_for_graph(file_location, doc_id=doc_id)
+        except Exception as kg_err:
+            logger.error("[ingest 3/5] GRAPH_BUILDING note for doc %d: %s", doc_id, kg_err, exc_info=True)
+
+        # Stage 5: INDEXING & INDEXED
+        update_doc_status(db, doc_id, "INDEXING")
+        logger.info("[ingest 4/5] INDEXING — Finalizing index metadata...")
+        update_doc_status(db, doc_id, "indexed", chunk_count=chunk_count)
+        logger.info("[ingest 5/5] SUCCESS — Doc %d fully indexed with %d chunks!", doc_id, chunk_count)
+
+    except Exception as e:
+        logger.error("[ingest] FAILED for doc %d: %s", doc_id, e, exc_info=True)
+        update_doc_status(db, doc_id, "error", error_detail=str(e)[:1000])
+        if os.path.exists(file_location):
+            try:
+                os.remove(file_location)
+            except Exception:
+                pass
     finally:
         db.close()
 
@@ -485,26 +510,17 @@ def upload_file(
 
     content_hash = sha256_of(file_location)
 
-    # Re-uploading an identical file used to silently double its embeddings.
-    duplicate = db.query(Document).filter(
-        Document.content_hash == content_hash,
-        Document.status == "indexed",
+    # Replacing an existing document or content hash: clear old vectors and graph relationships
+    previous = db.query(Document).filter(
+        (Document.filename == filename) | (Document.content_hash == content_hash)
     ).first()
-    if duplicate:
-        if os.path.abspath(duplicate.stored_path) != os.path.abspath(file_location):
-            os.remove(file_location)
-        raise HTTPException(
-            status_code=409,
-            detail=f"This file is already indexed as '{duplicate.filename}'. Delete it first if you want to re-upload.",
-        )
-
-    # Replacing a same-named document: clear the old vectors first.
-    previous = db.query(Document).filter(Document.filename == filename).first()
     if previous:
         try:
             delete_document_chunks(previous.stored_path, doc_id=previous.id)
+            from graph_service import graph_service
+            graph_service.delete_document_graph(previous.id)
         except Exception as e:
-            logger.warning("[upload] could not purge previous chunks for %s: %s", filename, e)
+            logger.warning("[upload] could not purge previous chunks/graph for %s: %s", filename, e)
         db.delete(previous)
         db.commit()
 
@@ -592,6 +608,12 @@ def delete_file(
             doc.stored_path if doc else file_location,
             doc_id=doc.id if doc else None,
         )
+        if doc:
+            try:
+                from graph_service import graph_service
+                graph_service.delete_document_graph(doc.id)
+            except Exception as kg_err:
+                logger.warning("[delete] Knowledge Graph deletion note: %s", kg_err)
         logger.info("[delete] purged %d embeddings for %s", removed, filename)
     except Exception as e:
         logger.error("[delete] Failed to purge embeddings: %s", e)

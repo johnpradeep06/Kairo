@@ -14,7 +14,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_community.vectorstores import Chroma
 from langchain_core.output_parsers import StrOutputParser
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.embeddings import Embeddings
 
 class JinaEmbeddings(Embeddings):
@@ -135,9 +135,11 @@ class RagResult:
 # IMPORTANT: these providers emit different vector dimensionalities.
 # Changing provider requires wiping the Chroma collection and re-ingesting
 # every document — see reindex_all_documents() in this module.
-EMBEDDING_PROVIDER = "jina:jina-embeddings-v5-text-small"
-embedding_func = JinaEmbeddings(
-    api_key=os.getenv("JINA_API_KEY")
+EMBEDDING_PROVIDER = "openrouter:text-embedding-3-small"
+embedding_func = OpenAIEmbeddings(
+    openai_api_key=OPENROUTER_API_KEY,
+    openai_api_base="https://openrouter.ai/api/v1",
+    model="text-embedding-3-small"
 )
 
 _provider_family = EMBEDDING_PROVIDER.split(":", 1)[0]
@@ -413,7 +415,7 @@ Standalone query:"""
 
 # Overridable without a code change, so switching between a paid model and a
 # free one (any id ending in `:free`) is an env edit plus a restart.
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b:free")
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1000"))
 
 llm = ChatOpenAI(

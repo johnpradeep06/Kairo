@@ -3,12 +3,13 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import UploadComponent from "../../components/Upload";
+import KnowledgeGraphView from "../../components/KnowledgeGraphView";
 import { apiJson } from "../../lib/api";
 import {
     ArrowLeft, LayoutDashboard, Database, Settings, FileText,
     Clock, Ticket, BarChart2, HelpCircle, Activity, ChevronRight,
     AlertCircle, Trash2, CheckCircle2, RotateCcw, Loader2, X,
-    ThumbsUp, ThumbsDown
+    ThumbsUp, ThumbsDown, Network
 } from "lucide-react";
 
 type UploadedFile = {
@@ -59,7 +60,17 @@ export default function AdminPage() {
     const [files, setFiles] = useState<UploadedFile[]>([]);
 
     // Tab routing state
-    const [activeTab, setActiveTab] = useState<'documents' | 'tickets' | 'faq' | 'analytics' | 'activity'>('documents');
+    const [activeTab, setActiveTab] = useState<'documents' | 'graph' | 'tickets' | 'faq' | 'analytics' | 'activity'>('documents');
+
+    useEffect(() => {
+        if (typeof window !== "undefined") {
+            const params = new URLSearchParams(window.location.search);
+            const tabParam = params.get("tab");
+            if (tabParam === "graph") {
+                setActiveTab("graph");
+            }
+        }
+    }, []);
 
     // Support tickets state
     const [tickets, setTickets] = useState<SupportTicket[]>([]);
@@ -584,6 +595,15 @@ export default function AdminPage() {
                         {activeTab === 'documents' && <span className="absolute bottom-0 left-0 w-full h-[2px] bg-accent rounded-full" />}
                     </button>
 
+                    <button
+                        onClick={() => setActiveTab('graph')}
+                        className={cn("pb-3 font-medium transition-all relative flex items-center gap-1.5", activeTab === 'graph' ? "text-accent-text font-semibold" : "hover:text-accent-text")}
+                    >
+                        <Network size={15} />
+                        Knowledge Graph
+                        {activeTab === 'graph' && <span className="absolute bottom-0 left-0 w-full h-[2px] bg-accent rounded-full" />}
+                    </button>
+
 
                     <button
                         onClick={() => setActiveTab('analytics')}
@@ -712,6 +732,11 @@ export default function AdminPage() {
                                     )}
                                 </div>
                             </>
+                        )}
+
+                        {/* TAB 1.5: Knowledge Graph Synthesis */}
+                        {activeTab === 'graph' && (
+                            <KnowledgeGraphView />
                         )}
 
                         {/* TAB 2: Support Tickets (Interactive Table) */}

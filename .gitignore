@@ -30,3 +30,5 @@ uploaded_files/
 Backend/users.db
 Backend/chroma_db/
 Backend/uploaded_files/
+Backend/*.db
+*.db
