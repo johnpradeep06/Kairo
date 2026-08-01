@@ -498,8 +498,10 @@ def fallback_heuristic_extraction(text: str, resolver: EntityResolver, provenanc
             add_rel(doc_entity.canonical_name, e.canonical_name, RelationshipType.REFERENCES)
 
     # 3. Sentence Co-occurrence Extraction for Dense Recall
-    sentences = text.split(".")
+    raw_sentences = re.split(r'[\.\n]+', text)
+    sentences = [s.strip() for s in raw_sentences if s.strip()]
     entities_by_name = {e.canonical_name: e for e in found_entities}
+    
     for sentence in sentences:
         sent_lower = sentence.lower()
         present = []
@@ -512,21 +514,35 @@ def fallback_heuristic_extraction(text: str, resolver: EntityResolver, provenanc
                 src = present[i]
                 tgt = present[j]
                 
+                # Determine subject (first) and object (second) by character index
+                src_pos = sent_lower.find(src.lower())
+                tgt_pos = sent_lower.find(tgt.lower())
+                first, second = (src, tgt) if src_pos < tgt_pos else (tgt, src)
+                
                 rel_type = RelationshipType.RELATED_TO
-                if "owns" in sent_lower:
+                
+                if "owns" in sent_lower or "owner" in sent_lower:
                     rel_type = RelationshipType.OWNS
-                elif "satisfies" in sent_lower or "implements" in sent_lower:
+                elif "implements" in sent_lower or "implement" in sent_lower or "satisfies" in sent_lower or "satisfy" in sent_lower:
                     rel_type = RelationshipType.SATISFIES
-                elif "mitigates" in sent_lower:
+                elif "mitigates" in sent_lower or "mitigate" in sent_lower:
                     rel_type = RelationshipType.MITIGATES
-                elif "protects" in sent_lower:
+                elif "protects" in sent_lower or "protect" in sent_lower:
                     rel_type = RelationshipType.PROTECTS
-                elif "uses" in sent_lower:
+                elif "uses" in sent_lower or "use" in sent_lower or "stores" in sent_lower or "hosts" in sent_lower:
                     rel_type = RelationshipType.USES
                 elif "depends" in sent_lower:
                     rel_type = RelationshipType.DEPENDS_ON
+                elif "references" in sent_lower:
+                    rel_type = RelationshipType.REFERENCES
+                elif "audits" in sent_lower:
+                    rel_type = RelationshipType.AUDITS
+                elif "violates" in sent_lower:
+                    rel_type = RelationshipType.VIOLATES
+                elif "generated" in sent_lower:
+                    rel_type = RelationshipType.GENERATED_BY
                     
-                add_rel(src, tgt, rel_type)
+                add_rel(first, second, rel_type)
 
     return ExtractionResult(
         entities=list(resolver.entities_by_id.values()),

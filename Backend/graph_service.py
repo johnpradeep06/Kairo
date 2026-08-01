@@ -319,14 +319,103 @@ Answer:"""
             answer=answer,
             graph_context=graph_context,
             seed_entities=seeds,
-            subgraph=subgraph,
+            subgraph=self._post_process_subgraph(subgraph),
             confidence=dyn_confidence,
             debug_info=debug_info
         )
 
+    def _post_process_subgraph(self, subgraph: SubGraph) -> SubGraph:
+        """Deduplicates relationships (merging properties) and maps edge endpoints to node UUIDs."""
+        if not subgraph:
+            return SubGraph()
+            
+        # 1. Deduplicate identical relationships (same source, relation, target canonical names)
+        grouped_edges = {}
+        for edge in subgraph.edges:
+            key = (edge.source.strip(), edge.relation.strip(), edge.target.strip())
+            if key not in grouped_edges:
+                grouped_edges[key] = []
+            grouped_edges[key].append(edge)
+            
+        deduplicated_edges = []
+        for key, edges in grouped_edges.items():
+            if len(edges) == 1:
+                deduplicated_edges.append(edges[0])
+                continue
+                
+            base_edge = edges[0]
+            chunk_ids = []
+            doc_ids = []
+            page_numbers = []
+            source_texts = []
+            confidences = []
+            
+            for e in edges:
+                if e.chunk_id:
+                    for cid in str(e.chunk_id).split(","):
+                        cid_clean = cid.strip()
+                        if cid_clean and cid_clean not in chunk_ids:
+                            chunk_ids.append(cid_clean)
+                if e.document_id:
+                    for did in str(e.document_id).split(","):
+                        did_clean = did.strip()
+                        if did_clean and did_clean not in doc_ids:
+                            doc_ids.append(did_clean)
+                if e.page_number is not None:
+                    if e.page_number not in page_numbers:
+                        page_numbers.append(e.page_number)
+                if e.source_text:
+                    st_clean = e.source_text.strip()
+                    if st_clean and st_clean not in source_texts:
+                        source_texts.append(st_clean)
+                confidences.append(e.confidence)
+                
+            base_edge.chunk_id = ", ".join(chunk_ids) if chunk_ids else None
+            base_edge.document_id = ", ".join(doc_ids) if doc_ids else None
+            base_edge.page_number = page_numbers[0] if page_numbers else None
+            base_edge.source_text = " | ".join(source_texts) if source_texts else None
+            base_edge.confidence = max(confidences) if confidences else 0.95
+            
+            deduplicated_edges.append(base_edge)
+
+        # 2. Build mapping {canonical_entity_name -> node_uuid}
+        name_to_uuid = {}
+        name_to_uuid_lower = {}
+        for node in subgraph.nodes:
+            name_to_uuid[node.label] = node.id
+            name_to_uuid_lower[node.label.lower().strip()] = node.id
+            
+        # 3. Map edge sources/targets to UUIDs, inserting placeholders for missing nodes
+        from uuid import uuid4
+        from graph_models import GraphNode
+        for edge in deduplicated_edges:
+            src_uuid = name_to_uuid.get(edge.source) or name_to_uuid_lower.get(edge.source.lower().strip())
+            tgt_uuid = name_to_uuid.get(edge.target) or name_to_uuid_lower.get(edge.target.lower().strip())
+            
+            if not src_uuid:
+                src_uuid = str(uuid4())
+                new_node = GraphNode(id=src_uuid, label=edge.source, type="Requirement")
+                subgraph.nodes.append(new_node)
+                name_to_uuid[edge.source] = src_uuid
+                name_to_uuid_lower[edge.source.lower().strip()] = src_uuid
+                
+            if not tgt_uuid:
+                tgt_uuid = str(uuid4())
+                new_node = GraphNode(id=tgt_uuid, label=edge.target, type="Requirement")
+                subgraph.nodes.append(new_node)
+                name_to_uuid[edge.target] = tgt_uuid
+                name_to_uuid_lower[edge.target.lower().strip()] = tgt_uuid
+                
+            edge.source = src_uuid
+            edge.target = tgt_uuid
+            
+        subgraph.edges = deduplicated_edges
+        return subgraph
+
     def get_visualization_data(self) -> SubGraph:
         """Retrieve full Knowledge Graph visualization payload without hardcoded seed filtering."""
-        return self.repository.get_full_graph(max_nodes=300)
+        subgraph = self.repository.get_full_graph(max_nodes=300)
+        return self._post_process_subgraph(subgraph)
 
     def get_stats(self) -> GraphStatsResponse:
         """Retrieve Knowledge Graph global analytics."""
