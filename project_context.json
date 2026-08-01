@@ -1,0 +1,62 @@
+{
+  "project_name": "Industrial & Engineering Intelligence Copilot",
+  "description": "An industrial AI agent platform featuring Universal Document Ingestion, Expert Knowledge Copilot, Maintenance Intelligence, and Regulatory Compliance.",
+  "architecture": {
+    "frontend": {
+      "framework": "Next.js 16 (App Router)",
+      "language": "TypeScript",
+      "styling": "Tailwind CSS v4",
+      "key_dependencies": [
+        "react",
+        "react-dom",
+        "lucide-react",
+        "react-markdown",
+        "@lottiefiles/dotlottie-react"
+      ],
+      "structure": [
+        "frontend/src/app/",
+        "frontend/src/components/",
+        "frontend/public/"
+      ]
+    },
+    "backend": {
+      "framework": "FastAPI",
+      "language": "Python 3.8+",
+      "database": "SQLite (users.db), ChromaDB (Vector DB)",
+      "key_dependencies": [
+        "fastapi",
+        "uvicorn",
+        "chromadb",
+        "bcrypt",
+        "passlib"
+      ],
+      "key_files": [
+        "Backend/app.py",
+        "Backend/auth.py",
+        "Backend/database.py",
+        "Backend/rag_pipeline.py"
+      ],
+      "endpoints": [
+        "POST /register",
+        "POST /token",
+        "POST /upload",
+        "POST /ask",
+        "GET /users/me"
+      ]
+    }
+  },
+  "roles": [
+    {
+      "role": "Manager",
+      "capabilities": ["Can ingest PDFs, P&IDs, and maintenance records", "Can query the knowledge graph"]
+    },
+    {
+      "role": "Technician",
+      "capabilities": ["Can query the copilot for maintenance and operational intelligence"]
+    }
+  ],
+  "infrastructure": {
+    "vector_database": "ChromaDB (Persistent storage to disk)",
+    "llm_provider": "OpenRouter API"
+  }
+}
