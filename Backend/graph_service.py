@@ -175,11 +175,34 @@ class GraphService:
         top_k: int = 5,
         depth: int = 2
     ) -> GraphRAGResponse:
-        """Perform seed entity traversal, construct Knowledge Graph context, and generate LLM response."""
-        seeds = self._extract_seed_terms(question)
-        subgraph = self.repository.get_subgraph_around_seeds(seeds, depth=depth, max_nodes=50)
+        """Redesigned graph-first retrieval pipeline implementing local entity matching & traversal."""
+        # 1. Local Entity Matching
+        matched_entities = self.repository.local_match_entities(question)
+        seeds = [m["canonical_name"] for m in matched_entities]
+        
+        subgraph = None
+        evidence_context = ""
+        citations = []
+        is_fallback_vector = False
 
-        # Build textual graph context snippet for LLM prompt
+        if seeds:
+            # 2. Graph Traversal (BFS)
+            subgraph = self.repository.get_subgraph_around_seeds(seeds, depth=depth, max_nodes=50)
+            
+            # 3. Vector Retrieval (Chroma chunks for traversed nodes only)
+            if subgraph and subgraph.nodes:
+                from rag_pipeline import retrieve_context_for_graph_nodes
+                evidence_context, citations, _ = retrieve_context_for_graph_nodes(subgraph.nodes)
+        
+        # If no seeds matched or no vector chunks found, fallback to vector search
+        if not evidence_context:
+            from rag_pipeline import retrieve_context
+            evidence_context, citations, _ = retrieve_context(question)
+            is_fallback_vector = True
+            if not subgraph:
+                subgraph = SubGraph()
+
+        # Compile Graph Facts context text
         context_lines: List[str] = ["=== ENTITIES IN GRAPH ==="]
         for node in subgraph.nodes:
             alias_str = f" (aka {', '.join(node.aliases)})" if node.aliases else ""
@@ -188,29 +211,89 @@ class GraphService:
         context_lines.append("\n=== COMPLIANCE RELATIONSHIPS & EVIDENCE ===")
         for edge in subgraph.edges:
             context_lines.append(
-                f"- ({edge.source}) --[{edge.relation} (confidence: {edge.confidence:.2f})]--> ({edge.target})"
+                f"- ({edge.source}) --[{edge.relation}]--> ({edge.target}) (Confidence: {edge.confidence:.2f})"
             )
-
         graph_context = "\n".join(context_lines)
 
+        # 4. Hybrid Prompt Construction
+        hybrid_prompt = f"""You are Kairo, a knowledgeable, concise, and professional Enterprise Compliance Copilot.
+Answer the User Question using only the provided compliance facts from the Knowledge Graph and Supporting Document Chunks.
+
+=== USER QUESTION ===
+{question}
+
+=== COMPLIANCE KNOWLEDGE GRAPH FACTS ===
+{graph_context}
+
+=== SUPPORTING DOCUMENT EVIDENCE CHUNKS ===
+{evidence_context}
+
+=== INSTRUCTIONS ===
+1. Only answer using the Graph Facts and Supporting Document Chunks provided above.
+2. Never invent entities, relationships, or facts not mentioned in the contexts.
+3. Never use external knowledge or repository files.
+4. If the required information does not exist in the contexts, explicitly state: "No supporting evidence found in uploaded documents."
+5. Cite the supporting documents using their citation markers, e.g. [1], [2], where appropriate.
+
+Answer:"""
+
+        # 5. Single LLM Call (Inference)
+        from rag_pipeline import llm
         try:
-            chain = GRAPH_RAG_PROMPT | llm | StrOutputParser()
-            answer = chain.invoke({"graph_context": graph_context, "question": question})
+            from langchain_core.prompts import PromptTemplate
+            from langchain_core.output_parsers import StrOutputParser
+            chain = PromptTemplate.from_template("{prompt}") | llm | StrOutputParser()
+            answer = chain.invoke({"prompt": hybrid_prompt})
         except Exception as err:
-            logger.warning("[graph_service] LLM Graph RAG invoke failed: %s. Generating deterministic Graph RAG response.", err)
-            answer_parts = [f"### Knowledge Graph RAG Subgraph Synthesis\n"]
-            answer_parts.append(f"**Query**: {question}\n")
-            if subgraph.nodes:
-                answer_parts.append("**Retrieved Compliance Entities:**")
-                for n in subgraph.nodes[:6]:
-                    answer_parts.append(f"- **[{n.type}]** {n.label}")
-            if subgraph.edges:
-                answer_parts.append("\n**Verified Graph Relationships:**")
-                for e in subgraph.edges[:6]:
-                    answer_parts.append(f"- `{e.source}` --**[{e.relation}]**--> `{e.target}` (Confidence: {(e.confidence * 100):.0f}%)")
+            logger.error("[graph_service] Redesigned Graph RAG LLM call failed: %s", err)
+            answer = "No supporting evidence found in uploaded documents due to service unavailability."
+
+        # Compile dynamic confidence score
+        num_nodes = len(subgraph.nodes)
+        num_edges = len(subgraph.edges)
+        if num_nodes == 0:
+            dyn_confidence = 0.0
+        else:
+            matched_seeds = 0
+            nodes_labels_lower = {n.label.lower() for n in subgraph.nodes}
+            for s in seeds:
+                s_clean = s.lower()
+                if any(s_clean in l or l in s_clean for l in nodes_labels_lower):
+                    matched_seeds += 1
+            seed_coverage = (matched_seeds / len(seeds)) if seeds else 0.0
+            subgraph_density = (num_edges / num_nodes) if num_nodes > 0 else 0.0
+            density_factor = min(subgraph_density / 2.0, 1.0)
+            avg_rel_confidence = sum(e.confidence for e in subgraph.edges) / num_edges if num_edges > 0 else 0.0
+            
+            if num_edges == 0:
+                dyn_confidence = 0.3 * seed_coverage + 0.2
             else:
-                answer_parts.append("\nNo direct graph edges found matching query seed terms.")
-            answer = "\n".join(answer_parts)
+                dyn_confidence = (0.3 * seed_coverage) + (0.3 * density_factor) + (0.4 * avg_rel_confidence)
+            dyn_confidence = max(min(dyn_confidence, 1.0), 0.05)
+
+        # 6. Graph Debug Panel Payload
+        import re
+        norm_query = question.lower().strip()
+        norm_query = re.sub(r'[^\w\s-]', '', norm_query)
+        
+        matched_aliases = []
+        for m in matched_entities:
+            if "matched_by" in m and m["matched_by"].startswith("alias:"):
+                matched_aliases.append(m["matched_by"].replace("alias: ", ""))
+
+        debug_info = {
+            "user_query": question,
+            "normalized_query": norm_query,
+            "matched_entities": [m["canonical_name"] for m in matched_entities],
+            "matched_aliases": matched_aliases,
+            "seed_nodes": seeds,
+            "traversal_depth": depth,
+            "traversed_nodes": [n.label for n in subgraph.nodes] if subgraph else [],
+            "traversed_relationships": [f"{e.source} --[{e.relation}]--> {e.target}" for e in subgraph.edges] if subgraph else [],
+            "supporting_chunks": [c.model_dump() for c in citations],
+            "prompt_length": len(hybrid_prompt),
+            "final_llm_request": hybrid_prompt
+        }
 
         return GraphRAGResponse(
             question=question,
@@ -218,7 +301,8 @@ class GraphService:
             graph_context=graph_context,
             seed_entities=seeds,
             subgraph=subgraph,
-            confidence=0.96 if subgraph.nodes else 0.50
+            confidence=dyn_confidence,
+            debug_info=debug_info
         )
 
     def get_visualization_data(self) -> SubGraph:

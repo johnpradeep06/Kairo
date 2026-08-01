@@ -275,10 +275,13 @@ def extract_from_chunk(
         if isinstance(item, str):
             name = item.strip()
             aliases = []
-            etype = EntityType.REQUIREMENT
+            etype_str = "Requirement"
         elif isinstance(item, dict):
             name = str(item.get("name", item.get("canonical_name", ""))).strip()
             aliases = item.get("aliases", []) if isinstance(item.get("aliases"), list) else []
+            etype_str = str(item.get("type", item.get("entity_type", "Requirement"))).strip()
+        else:
+            continue
 
         if etype_str not in valid_entity_types:
             etype_str = "Document" if "document" in name.lower() else "Requirement"

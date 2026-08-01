@@ -107,6 +107,10 @@ class GraphNode(BaseModel):
     type: str
     aliases: List[str] = Field(default_factory=list)
     document_count: int = 1
+    document_id: Optional[Union[str, int]] = None
+    page_number: Optional[int] = None
+    chunk_id: Optional[Union[str, int]] = None
+    source_text: Optional[str] = None
 
 
 class GraphEdge(BaseModel):
@@ -116,6 +120,9 @@ class GraphEdge(BaseModel):
     relation: str
     confidence: float
     document_id: Optional[Union[str, int]] = None
+    page_number: Optional[int] = None
+    chunk_id: Optional[Union[str, int]] = None
+    source_text: Optional[str] = None
 
 
 class SubGraph(BaseModel):
@@ -136,6 +143,7 @@ class GraphRAGResponse(BaseModel):
     seed_entities: List[str]
     subgraph: SubGraph
     confidence: float
+    debug_info: Optional[Dict[str, Any]] = None
 
 
 class GraphStatsResponse(BaseModel):

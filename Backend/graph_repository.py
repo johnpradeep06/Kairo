@@ -49,6 +49,11 @@ class Neo4jGraphRepository:
         self.driver: Optional[Any] = None
         self.use_fallback = False
         self._fallback_db_path = os.path.join(os.path.dirname(__file__), "kairo_graph_fallback.db")
+        
+        # Performance caches
+        self._entity_match_cache = {}
+        self._subgraph_cache = {}
+        self._all_entities_cache = None
 
         if HAS_NEO4J_DRIVER:
             try:
@@ -64,6 +69,12 @@ class Neo4jGraphRepository:
         else:
             self.use_fallback = True
             self._init_fallback_db()
+
+    def _clear_caches(self):
+        """Invalidate performance caches when database elements are modified."""
+        self._entity_match_cache.clear()
+        self._subgraph_cache.clear()
+        self._all_entities_cache = None
 
     def _init_fallback_db(self):
         """Initialize SQLite fallback graph database if Neo4j is offline."""
@@ -134,30 +145,31 @@ class Neo4jGraphRepository:
 
     def upsert_extraction_result(self, result: ExtractionResult) -> Tuple[int, int]:
         """Save extracted entities & relationships to Neo4j or SQLite persistent store."""
+        self._clear_caches()
         if self.use_fallback or not self.driver:
             return self._fallback_upsert(result)
 
-        nodes_count = 0
-        edges_count = 0
+        try:
+            nodes_count = 0
+            edges_count = 0
 
-        with self.driver.session() as session:
-            for entity in result.entities:
-                prov = entity.provenance[0] if entity.provenance else None
-                doc_id = str(prov.document_id) if prov else ""
-                page_num = prov.page_number if prov else 1
-                chunk_id = str(prov.chunk_id) if prov else ""
-                src_text = str(prov.source_text)[:500] if prov else ""
+            with self.driver.session() as session:
+                for entity in result.entities:
+                    prov = entity.provenance[0] if entity.provenance else None
+                    doc_id = str(prov.document_id) if prov else ""
+                    page_num = prov.page_number if prov else 1
+                    chunk_id = str(prov.chunk_id) if prov else ""
+                    src_text = str(prov.source_text)[:500] if prov else ""
 
-                cypher_node = """
-                MERGE (e:Entity {canonical_name: $name})
-                ON CREATE SET e.id = $id, e.entity_type = $type, e.aliases = $aliases,
-                              e.document_id = $doc_id, e.page_number = $page,
-                              e.chunk_id = $chunk_id, e.source_text = $source_text
-                ON MATCH SET e.aliases = $aliases, e.entity_type = $type,
-                             e.document_id = $doc_id, e.page_number = $page,
-                             e.chunk_id = $chunk_id, e.source_text = $source_text
-                """
-                try:
+                    cypher_node = """
+                    MERGE (e:Entity {canonical_name: $name})
+                    ON CREATE SET e.id = $id, e.entity_type = $type, e.aliases = $aliases,
+                                  e.document_id = $doc_id, e.page_number = $page,
+                                  e.chunk_id = $chunk_id, e.source_text = $source_text
+                    ON MATCH SET e.aliases = $aliases, e.entity_type = $type,
+                                 e.document_id = $doc_id, e.page_number = $page,
+                                 e.chunk_id = $chunk_id, e.source_text = $source_text
+                    """
                     session.run(cypher_node,
                                 name=entity.canonical_name,
                                 id=entity.id,
@@ -168,18 +180,15 @@ class Neo4jGraphRepository:
                                 chunk_id=chunk_id,
                                 source_text=src_text)
                     nodes_count += 1
-                except Exception as e:
-                    logger.error("[graph_repository] Failed to MERGE node %s: %s", entity.canonical_name, e)
 
-            for rel in result.relationships:
-                cypher_rel = """
-                MATCH (a:Entity {canonical_name: $source})
-                MATCH (b:Entity {canonical_name: $target})
-                MERGE (a)-[r:COMPLIANCE_REL {type: $relation}]->(b)
-                ON CREATE SET r.confidence = $confidence, r.extraction_method = $method, r.document_id = $doc_id
-                """
-                doc_id = str(rel.provenance[0].document_id) if rel.provenance else ""
-                try:
+                for rel in result.relationships:
+                    cypher_rel = """
+                    MATCH (a:Entity {canonical_name: $source})
+                    MATCH (b:Entity {canonical_name: $target})
+                    MERGE (a)-[r:COMPLIANCE_REL {type: $relation}]->(b)
+                    ON CREATE SET r.confidence = $confidence, r.extraction_method = $method, r.document_id = $doc_id
+                    """
+                    doc_id = str(rel.provenance[0].document_id) if rel.provenance else ""
                     session.run(cypher_rel,
                                 source=rel.source,
                                 target=rel.target,
@@ -188,10 +197,12 @@ class Neo4jGraphRepository:
                                 method=rel.extraction_method,
                                 doc_id=doc_id)
                     edges_count += 1
-                except Exception as e:
-                    logger.error("[graph_repository] Failed to MERGE relationship %s -> %s: %s", rel.source, rel.target, e)
 
-        return nodes_count, edges_count
+            return nodes_count, edges_count
+        except Exception as e:
+            logger.warning("[graph_repository] Neo4j upsert failed: %s. Switching to SQLite fallback.", e)
+            self.use_fallback = True
+            return self._fallback_upsert(result)
 
     def _fallback_upsert(self, result: ExtractionResult) -> Tuple[int, int]:
         """Fallback graph insertion in SQLite."""
@@ -250,72 +261,36 @@ class Neo4jGraphRepository:
         if self.use_fallback or not self.driver:
             return self._fallback_get_subgraph(seed_names, depth, max_nodes)
 
-        cypher = """
-        MATCH (s:Entity) WHERE s.canonical_name IN $seed_names OR any(a IN s.aliases WHERE a IN $seed_names)
-        MATCH path = (s)-[*1..2]-(t:Entity)
-        WITH path LIMIT $max_nodes
-        UNWIND nodes(path) as n
-        UNWIND relationships(path) as r
-        RETURN collect(distinct n) as nodes, collect(distinct r) as rels
-        """
+        try:
+            cypher = """
+            MATCH (s:Entity) WHERE s.canonical_name IN $seed_names OR any(a IN s.aliases WHERE a IN $seed_names)
+            MATCH path = (s)-[*1..2]-(t:Entity)
+            WITH path LIMIT $max_nodes
+            UNWIND nodes(path) as n
+            UNWIND relationships(path) as r
+            RETURN collect(distinct n) as nodes, collect(distinct r) as rels
+            """
 
-        nodes_map: Dict[str, GraphNode] = {}
-        edges_list: List[GraphEdge] = []
+            nodes_map: Dict[str, GraphNode] = {}
+            edges_list: List[GraphEdge] = []
 
-        with self.driver.session() as session:
-            res = session.run(cypher, seed_names=seed_names, max_nodes=max_nodes)
-            record = res.single()
-            if record:
-                for n in record["nodes"]:
-                    nid = n.get("id", n["canonical_name"])
-                    nodes_map[nid] = GraphNode(
-                        id=nid,
-                        label=n["canonical_name"],
-                        type=n.get("entity_type", "Entity"),
-                        aliases=n.get("aliases", [])
-                    )
-                for r in record["rels"]:
-                    start_node = r.nodes[0]["canonical_name"]
-                    end_node = r.nodes[1]["canonical_name"]
-                    edges_list.append(GraphEdge(
-                        id=str(r.id),
-                        source=start_node,
-                        target=end_node,
-                        relation=r.get("type", "RELATED_TO"),
-                        confidence=r.get("confidence", 0.95),
-                        document_id=r.get("document_id")
-                    ))
-
-        return SubGraph(nodes=list(nodes_map.values()), edges=edges_list)
-
-    def get_full_graph(self, max_nodes: int = 300) -> SubGraph:
-        """Retrieve full graph nodes and edges for visualization without seed filtering."""
-        if self.use_fallback or not self.driver:
-            return self._fallback_get_full_graph(max_nodes)
-
-        cypher = """
-        MATCH (n:Entity)
-        OPTIONAL MATCH (n)-[r:COMPLIANCE_REL]->(m:Entity)
-        WITH collect(distinct n) as nodes, collect(distinct r) as rels
-        RETURN nodes, rels
-        """
-        nodes_map: Dict[str, GraphNode] = {}
-        edges_list: List[GraphEdge] = []
-
-        with self.driver.session() as session:
-            res = session.run(cypher, max_nodes=max_nodes)
-            record = res.single()
-            if record:
-                for n in record["nodes"]:
-                    nid = n.get("id", n["canonical_name"])
-                    nodes_map[nid] = GraphNode(
-                        id=nid,
-                        label=n["canonical_name"],
-                        type=n.get("entity_type", "Requirement"),
-                        aliases=n.get("aliases", [])
-                    )
-                for r in record["rels"]:
-                    if r is not None:
+            with self.driver.session() as session:
+                res = session.run(cypher, seed_names=seed_names, max_nodes=max_nodes)
+                record = res.single()
+                if record:
+                    for n in record["nodes"]:
+                        nid = n.get("id", n["canonical_name"])
+                        nodes_map[nid] = GraphNode(
+                            id=nid,
+                            label=n["canonical_name"],
+                            type=n.get("entity_type", "Entity"),
+                            aliases=n.get("aliases", []),
+                            document_id=n.get("document_id"),
+                            page_number=n.get("page_number"),
+                            chunk_id=n.get("chunk_id"),
+                            source_text=n.get("source_text")
+                        )
+                    for r in record["rels"]:
                         start_node = r.nodes[0]["canonical_name"]
                         end_node = r.nodes[1]["canonical_name"]
                         edges_list.append(GraphEdge(
@@ -324,10 +299,66 @@ class Neo4jGraphRepository:
                             target=end_node,
                             relation=r.get("type", "RELATED_TO"),
                             confidence=r.get("confidence", 0.95),
-                            document_id=r.get("document_id")
+                            document_id=r.get("document_id"),
+                            chunk_id=r.get("chunk_id")
                         ))
 
-        return SubGraph(nodes=list(nodes_map.values()), edges=edges_list)
+            return SubGraph(nodes=list(nodes_map.values()), edges=edges_list)
+        except Exception as e:
+            logger.warning("[graph_repository] Neo4j get_subgraph_around_seeds failed: %s. Switching to SQLite fallback.", e)
+            self.use_fallback = True
+            return self._fallback_get_subgraph(seed_names, depth, max_nodes)
+
+    def get_full_graph(self, max_nodes: int = 300) -> SubGraph:
+        """Retrieve full graph nodes and edges for visualization without seed filtering."""
+        if self.use_fallback or not self.driver:
+            return self._fallback_get_full_graph(max_nodes)
+
+        try:
+            cypher = """
+            MATCH (n:Entity)
+            OPTIONAL MATCH (n)-[r:COMPLIANCE_REL]->(m:Entity)
+            WITH collect(distinct n) as nodes, collect(distinct r) as rels
+            RETURN nodes, rels
+            """
+            nodes_map: Dict[str, GraphNode] = {}
+            edges_list: List[GraphEdge] = []
+
+            with self.driver.session() as session:
+                res = session.run(cypher, max_nodes=max_nodes)
+                record = res.single()
+                if record:
+                    for n in record["nodes"]:
+                        nid = n.get("id", n["canonical_name"])
+                        nodes_map[nid] = GraphNode(
+                            id=nid,
+                            label=n["canonical_name"],
+                            type=n.get("entity_type", "Requirement"),
+                            aliases=n.get("aliases", []),
+                            document_id=n.get("document_id"),
+                            page_number=n.get("page_number"),
+                            chunk_id=n.get("chunk_id"),
+                            source_text=n.get("source_text")
+                        )
+                    for r in record["rels"]:
+                        if r is not None:
+                            start_node = r.nodes[0]["canonical_name"]
+                            end_node = r.nodes[1]["canonical_name"]
+                            edges_list.append(GraphEdge(
+                                id=str(r.id),
+                                source=start_node,
+                                target=end_node,
+                                relation=r.get("type", "RELATED_TO"),
+                                confidence=r.get("confidence", 0.95),
+                                document_id=r.get("document_id"),
+                                chunk_id=r.get("chunk_id")
+                            ))
+
+            return SubGraph(nodes=list(nodes_map.values()), edges=edges_list)
+        except Exception as e:
+            logger.warning("[graph_repository] Neo4j get_full_graph failed: %s. Switching to SQLite fallback.", e)
+            self.use_fallback = True
+            return self._fallback_get_full_graph(max_nodes)
 
     def _fallback_get_full_graph(self, max_nodes: int = 300) -> SubGraph:
         import json
@@ -335,15 +366,32 @@ class Neo4jGraphRepository:
         edges_list: List[GraphEdge] = []
         with sqlite3.connect(self._fallback_db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id, canonical_name, aliases, entity_type FROM entities LIMIT ?", (max_nodes,))
+            cursor.execute("SELECT id, canonical_name, aliases, entity_type, document_id, page_number, chunk_id, source_text FROM entities LIMIT ?", (max_nodes,))
             for row in cursor.fetchall():
-                eid, name, aliases_json, etype = row
-                nodes_map[name] = GraphNode(id=eid, label=name, type=etype, aliases=json.loads(aliases_json or "[]"))
+                eid, name, aliases_json, etype, doc_id, page, chunk_id, src_text = row
+                nodes_map[name] = GraphNode(
+                    id=eid,
+                    label=name,
+                    type=etype,
+                    aliases=json.loads(aliases_json or "[]"),
+                    document_id=doc_id,
+                    page_number=page,
+                    chunk_id=chunk_id,
+                    source_text=src_text
+                )
 
-            cursor.execute("SELECT id, source, target, relation, confidence, document_id FROM relationships LIMIT ?", (max_nodes * 2,))
+            cursor.execute("SELECT id, source, target, relation, confidence, document_id, chunk_id FROM relationships LIMIT ?", (max_nodes * 2,))
             for r in cursor.fetchall():
-                rid, src, tgt, rel, conf, doc_id = r
-                edges_list.append(GraphEdge(id=str(rid), source=src, target=tgt, relation=rel, confidence=conf, document_id=doc_id))
+                rid, src, tgt, rel, conf, doc_id, chunk_id = r
+                edges_list.append(GraphEdge(
+                    id=str(rid),
+                    source=src,
+                    target=tgt,
+                    relation=rel,
+                    confidence=conf,
+                    document_id=doc_id,
+                    chunk_id=chunk_id
+                ))
                 if src not in nodes_map:
                     nodes_map[src] = GraphNode(id=src, label=src, type="Requirement", aliases=[])
                 if tgt not in nodes_map:
@@ -363,16 +411,20 @@ class Neo4jGraphRepository:
         with sqlite3.connect(self._fallback_db_path) as conn:
             cursor = conn.cursor()
             
-            cursor.execute("SELECT id, canonical_name, aliases, entity_type FROM entities")
+            cursor.execute("SELECT id, canonical_name, aliases, entity_type, document_id, page_number, chunk_id, source_text FROM entities")
             all_entities = {}
             for row in cursor.fetchall():
-                eid, name, aliases_json, etype = row
+                eid, name, aliases_json, etype, doc_id, page, chunk_id, src_text = row
                 aliases = json.loads(aliases_json or "[]")
                 all_entities[name] = {
                     "id": eid,
                     "canonical_name": name,
                     "aliases": aliases,
-                    "entity_type": etype
+                    "entity_type": etype,
+                    "document_id": doc_id,
+                    "page_number": page,
+                    "chunk_id": chunk_id,
+                    "source_text": src_text
                 }
             
             visited_nodes = set()
@@ -387,17 +439,18 @@ class Neo4jGraphRepository:
                     if any(seed in name.lower() or name.lower() in seed for seed in normalized_seeds):
                         visited_nodes.add(name)
             
-            cursor.execute("SELECT id, source, target, relation, confidence, document_id FROM relationships")
+            cursor.execute("SELECT id, source, target, relation, confidence, document_id, chunk_id FROM relationships")
             all_rels = []
             for row in cursor.fetchall():
-                rid, src, tgt, rel, conf, doc_id = row
+                rid, src, tgt, rel, conf, doc_id, chunk_id = row
                 all_rels.append({
                     "id": rid,
                     "source": src,
                     "target": tgt,
                     "relation": rel,
                     "confidence": conf,
-                    "document_id": doc_id
+                    "document_id": doc_id,
+                    "chunk_id": chunk_id
                 })
             
             current_level = set(visited_nodes)
@@ -416,7 +469,8 @@ class Neo4jGraphRepository:
                             target=tgt,
                             relation=rel["relation"],
                             confidence=rel["confidence"],
-                            document_id=rel["document_id"]
+                            document_id=rel["document_id"],
+                            chunk_id=rel["chunk_id"]
                         )
                         if edge_obj not in traversed_edges:
                             traversed_edges.append(edge_obj)
@@ -439,7 +493,11 @@ class Neo4jGraphRepository:
                         id=data["id"],
                         label=data["canonical_name"],
                         type=data["entity_type"],
-                        aliases=data["aliases"]
+                        aliases=data["aliases"],
+                        document_id=data.get("document_id"),
+                        page_number=data.get("page_number"),
+                        chunk_id=data.get("chunk_id"),
+                        source_text=data.get("source_text")
                     )
                 else:
                     nodes_map[name] = GraphNode(
@@ -462,65 +520,184 @@ class Neo4jGraphRepository:
             
         return SubGraph(nodes=list(final_nodes.values()), edges=edges_list)
 
-    def delete_document_graph(self, document_id: Union[str, int]) -> int:
-        """Remove all relationships and orphan nodes associated with a document ID."""
-        doc_str = str(document_id)
-        if self.use_fallback:
+    def local_match_entities(self, query: str) -> List[Dict[str, Any]]:
+        """Perform query normalization and local node/alias fuzzy & exact matching without LLM calls."""
+        import re
+        norm_query = query.lower().strip()
+        norm_query = re.sub(r'[^\w\s-]', '', norm_query)
+        words = norm_query.split()
+        
+        entities_list = []
+        if self.use_fallback or not self.driver:
+            import json
             with sqlite3.connect(self._fallback_db_path) as conn:
                 cursor = conn.cursor()
-                cursor.execute("DELETE FROM relationships WHERE document_id = ?", (doc_str,))
-                deleted = cursor.rowcount
-                conn.commit()
-                return deleted
+                cursor.execute("SELECT id, canonical_name, aliases, entity_type FROM entities")
+                for row in cursor.fetchall():
+                    eid, name, aliases_json, etype = row
+                    entities_list.append({
+                        "id": eid,
+                        "canonical_name": name,
+                        "aliases": json.loads(aliases_json or "[]"),
+                        "type": etype
+                    })
+        else:
+            try:
+                cypher = "MATCH (e:Entity) RETURN e.id as id, e.canonical_name as name, e.aliases as aliases, e.entity_type as type"
+                with self.driver.session() as session:
+                    res = session.run(cypher)
+                    for r in res:
+                        entities_list.append({
+                            "id": r["id"],
+                            "canonical_name": r["name"],
+                            "aliases": r["aliases"] or [],
+                            "type": r["type"]
+                        })
+            except Exception as e:
+                logger.warning("[graph_repository] Neo4j local entity fetch failed: %s. Using SQLite fallback.", e)
+                import json
+                with sqlite3.connect(self._fallback_db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id, canonical_name, aliases, entity_type FROM entities")
+                    for row in cursor.fetchall():
+                        eid, name, aliases_json, etype = row
+                        entities_list.append({
+                            "id": eid,
+                            "canonical_name": name,
+                            "aliases": json.loads(aliases_json or "[]"),
+                            "type": etype
+                        })
 
-        cypher = """
-        MATCH ()-[r:COMPLIANCE_REL]->()
-        WHERE r.document_id = $doc_id
-        DELETE r
-        RETURN count(r) as deleted_count
-        """
-        with self.driver.session() as session:
-            res = session.run(cypher, doc_id=doc_str)
-            rec = res.single()
-            return rec["deleted_count"] if rec else 0
+        matched = []
+        for ent in entities_list:
+            canonical_lower = ent["canonical_name"].lower().strip()
+            if canonical_lower == norm_query or canonical_lower in norm_query or norm_query in canonical_lower:
+                confidence = 1.0 if canonical_lower == norm_query else 0.85
+                matched.append({
+                    "id": ent["id"],
+                    "canonical_name": ent["canonical_name"],
+                    "matched_by": "canonical",
+                    "confidence": confidence,
+                    "type": ent["type"]
+                })
+                continue
+                
+            alias_match = False
+            for alias in ent["aliases"]:
+                alias_lower = alias.lower().strip()
+                if alias_lower == norm_query or alias_lower in norm_query or norm_query in alias_lower:
+                    confidence = 0.95 if alias_lower == norm_query else 0.80
+                    matched.append({
+                        "id": ent["id"],
+                        "canonical_name": ent["canonical_name"],
+                        "matched_by": f"alias: {alias}",
+                        "confidence": confidence,
+                        "type": ent["type"]
+                    })
+                    alias_match = True
+                    break
+            if alias_match:
+                continue
+
+            ent_words = set(canonical_lower.replace("-", " ").split())
+            query_words = set(words)
+            overlap = ent_words.intersection(query_words)
+            if overlap:
+                match_ratio = len(overlap) / max(len(query_words), 1)
+                if match_ratio >= 0.4:
+                    matched.append({
+                        "id": ent["id"],
+                        "canonical_name": ent["canonical_name"],
+                        "matched_by": "word_overlap",
+                        "confidence": round(0.5 + 0.3 * match_ratio, 2),
+                        "type": ent["type"]
+                    })
+
+        unique_matches = {}
+        for m in matched:
+            name = m["canonical_name"]
+            if name not in unique_matches or m["confidence"] > unique_matches[name]["confidence"]:
+                unique_matches[name] = m
+                
+        return list(unique_matches.values())
+
+    def delete_document_graph(self, document_id: Union[str, int]) -> int:
+        """Remove all relationships and orphan nodes associated with a document ID."""
+        self._clear_caches()
+        if self.use_fallback or not self.driver:
+            return self._fallback_delete(document_id)
+
+        try:
+            doc_str = str(document_id)
+            cypher = """
+            MATCH ()-[r:COMPLIANCE_REL]->()
+            WHERE r.document_id = $doc_id
+            DELETE r
+            RETURN count(r) as deleted_count
+            """
+            with self.driver.session() as session:
+                res = session.run(cypher, doc_id=doc_str)
+                rec = res.single()
+                return rec["deleted_count"] if rec else 0
+        except Exception as e:
+            logger.warning("[graph_repository] Neo4j delete failed: %s. Switching to SQLite fallback.", e)
+            self.use_fallback = True
+            return self._fallback_delete(document_id)
+
+    def _fallback_delete(self, document_id: Union[str, int]) -> int:
+        doc_str = str(document_id)
+        with sqlite3.connect(self._fallback_db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM relationships WHERE document_id = ?", (doc_str,))
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted
 
     def get_stats(self) -> GraphStatsResponse:
         """Get Knowledge Graph aggregate metrics."""
         if self.use_fallback or not self.driver:
-            with sqlite3.connect(self._fallback_db_path) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT count(*) FROM entities")
-                total_nodes = cur.fetchone()[0]
-                cur.execute("SELECT count(*) FROM relationships")
-                total_rels = cur.fetchone()[0]
-                cur.execute("SELECT count(DISTINCT document_id) FROM relationships WHERE document_id IS NOT NULL AND document_id != ''")
-                docs = cur.fetchone()[0]
+            return self._fallback_get_stats()
 
-                cur.execute("SELECT entity_type, count(*) FROM entities GROUP BY entity_type")
-                entity_type_counts = {row[0]: row[1] for row in cur.fetchall()}
-
-                cur.execute("SELECT relation, count(*) FROM relationships GROUP BY relation")
-                rel_type_counts = {row[0]: row[1] for row in cur.fetchall()}
+        try:
+            with self.driver.session() as session:
+                n_res = session.run("MATCH (n:Entity) RETURN count(n) as total_nodes").single()
+                r_res = session.run("MATCH ()-[r:COMPLIANCE_REL]->() RETURN count(r) as total_rels").single()
+                d_res = session.run("MATCH ()-[r:COMPLIANCE_REL]->() RETURN count(distinct r.document_id) as total_docs").single()
 
                 return GraphStatsResponse(
-                    total_nodes=total_nodes,
-                    total_relationships=total_rels,
-                    entity_type_counts=entity_type_counts,
-                    relationship_type_counts=rel_type_counts,
-                    documents_indexed=max(docs, 1)
+                    total_nodes=n_res["total_nodes"] if n_res else 0,
+                    total_relationships=r_res["total_rels"] if r_res else 0,
+                    entity_type_counts={"Neo4jNodes": n_res["total_nodes"] if n_res else 0},
+                    relationship_type_counts={"Neo4jEdges": r_res["total_rels"] if r_res else 0},
+                    documents_indexed=d_res["total_docs"] if d_res else 0
                 )
+        except Exception as e:
+            logger.warning("[graph_repository] Neo4j get_stats failed: %s. Switching to SQLite fallback.", e)
+            self.use_fallback = True
+            return self._fallback_get_stats()
 
-        with self.driver.session() as session:
-            n_res = session.run("MATCH (n:Entity) RETURN count(n) as total_nodes").single()
-            r_res = session.run("MATCH ()-[r:COMPLIANCE_REL]->() RETURN count(r) as total_rels").single()
-            d_res = session.run("MATCH ()-[r:COMPLIANCE_REL]->() RETURN count(distinct r.document_id) as total_docs").single()
+    def _fallback_get_stats(self) -> GraphStatsResponse:
+        with sqlite3.connect(self._fallback_db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT count(*) FROM entities")
+            total_nodes = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM relationships")
+            total_rels = cur.fetchone()[0]
+            cur.execute("SELECT count(DISTINCT document_id) FROM relationships WHERE document_id IS NOT NULL AND document_id != ''")
+            docs = cur.fetchone()[0]
+
+            cur.execute("SELECT entity_type, count(*) FROM entities GROUP BY entity_type")
+            entity_type_counts = {row[0]: row[1] for row in cur.fetchall()}
+
+            cur.execute("SELECT relation, count(*) FROM relationships GROUP BY relation")
+            rel_type_counts = {row[0]: row[1] for row in cur.fetchall()}
 
             return GraphStatsResponse(
-                total_nodes=n_res["total_nodes"] if n_res else 0,
-                total_relationships=r_res["total_rels"] if r_res else 0,
-                entity_type_counts={"Neo4jNodes": n_res["total_nodes"] if n_res else 0},
-                relationship_type_counts={"Neo4jEdges": r_res["total_rels"] if r_res else 0},
-                documents_indexed=d_res["total_docs"] if d_res else 0
+                total_nodes=total_nodes,
+                total_relationships=total_rels,
+                entity_type_counts=entity_type_counts,
+                relationship_type_counts=rel_type_counts,
+                documents_indexed=max(docs, 1)
             )
 
 

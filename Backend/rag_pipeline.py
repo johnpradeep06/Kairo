@@ -201,6 +201,7 @@ def ingest_document(file_path: str, doc_id: int | None = None) -> int:
         chunk.metadata["chunk_index"] = i
         if doc_id is not None:
             chunk.metadata["doc_id"] = doc_id
+            chunk.metadata["chunk_id"] = f"{doc_id}_chunk_{i}"
 
     if splits:
         vectorstore.add_documents(documents=splits)
@@ -318,6 +319,66 @@ def retrieve_context(question: str) -> tuple[str, list[Citation], float]:
         blocks.append(f"{header}\n{doc.page_content}")
 
     return "\n\n".join(blocks), citations, highest_score
+
+
+def retrieve_context_for_graph_nodes(nodes: list) -> tuple[str, list[Citation], float]:
+    """Retrieve exact Chroma splits corresponding to traversed GraphNode provenance chunk IDs."""
+    doc_chunk_indices = {}
+    for n in nodes:
+        doc_id = getattr(n, "document_id", None)
+        chunk_id = getattr(n, "chunk_id", None)
+        if doc_id is not None and chunk_id is not None:
+            try:
+                parts = str(chunk_id).split("_chunk_")
+                if len(parts) == 2:
+                    d_id = int(parts[0])
+                    c_idx = int(parts[1])
+                    if d_id not in doc_chunk_indices:
+                        doc_chunk_indices[d_id] = set()
+                    doc_chunk_indices[d_id].add(c_idx)
+            except Exception:
+                pass
+
+    if not doc_chunk_indices:
+        return "", [], 0.0
+
+    matched_docs = []
+    for d_id, c_indexes in doc_chunk_indices.items():
+        try:
+            res = vectorstore.get(where={"doc_id": int(d_id)})
+            if res and "documents" in res:
+                for doc_text, meta in zip(res["documents"], res["metadatas"]):
+                    c_idx = meta.get("chunk_index")
+                    if c_idx is not None and int(c_idx) in c_indexes:
+                        matched_docs.append((doc_text, meta))
+        except Exception as e:
+            print(f"[rag_pipeline] Chroma fetch failed for doc_id {d_id}: {e}")
+
+    if not matched_docs:
+        return "", [], 0.0
+
+    citations: list[Citation] = []
+    blocks: list[str] = []
+    for i, (text, meta) in enumerate(matched_docs, start=1):
+        name = meta.get("filename") or "Unknown Document"
+        page = meta.get("page")
+        snippet = " ".join(text.split())[:120]
+
+        citations.append(Citation(
+            index=i,
+            document=name,
+            page=int(page) if isinstance(page, (int, float)) else None,
+            snippet=snippet,
+            score=0.95,
+            doc_id=meta.get("doc_id"),
+        ))
+
+        header = f"[{i}] {name}"
+        if page is not None:
+            header += f" (page {int(page) + 1})"
+        blocks.append(f"{header}\n{text}")
+
+    return "\n\n".join(blocks), citations, 0.95
 
 
 def _confidence_from(highest_score: float, citations: list[Citation]) -> float:
