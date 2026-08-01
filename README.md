@@ -1,6 +1,6 @@
-# Valar - Enterprise Support Copilot
+# Kairo - Enterprise Support Copilot
 
-Valar is an enterprise-grade customer support assistant and documentation retrieval platform. It integrates a deterministic FAQ matching layer, a dense passage retrieval (RAG) system, and an automated web search fallback with analytics logging. 
+Kairo is an enterprise-grade customer support assistant and documentation retrieval platform. It integrates a deterministic FAQ matching layer, a dense passage retrieval (RAG) system, and an automated web search fallback with analytics logging. 
 
 The architecture consists of a Next.js (TypeScript/Tailwind CSS) frontend communicating with a FastAPI backend, supported by SQLite for structural relational data and ChromaDB for vector retrieval.
 
