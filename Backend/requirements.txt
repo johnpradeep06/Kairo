@@ -17,4 +17,5 @@ google-api-python-client
 exa-py
 python-docx
 docx2txt
-langchain-google-genai
+langchain-google-genai
+neo4j

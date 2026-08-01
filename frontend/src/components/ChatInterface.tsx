@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback, Children } from "react";
-import { Send, Menu, Plus, Bot, Loader2, MessageSquare, X, Globe, Building, HelpCircle, BookOpen, Briefcase, Download, Ticket, ThumbsUp, ThumbsDown, RotateCcw, Copy, Trash2, CheckCircle2, FileText, AlertTriangle, Sparkles, ChevronDown, ShieldCheck, LayoutDashboard } from "lucide-react";
+import { Send, Menu, Plus, Bot, Loader2, MessageSquare, X, Globe, Building, HelpCircle, BookOpen, Briefcase, Download, Ticket, ThumbsUp, ThumbsDown, RotateCcw, Copy, Trash2, CheckCircle2, FileText, AlertTriangle, Sparkles, ChevronDown, ShieldCheck, LayoutDashboard, Network } from "lucide-react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import ReactMarkdown from 'react-markdown';
@@ -1162,6 +1162,14 @@ export default function ChatInterface({ role, handleLogout }: ChatInterfaceProps
                             ) : (
                                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-blue-400"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" /></svg>
                             )}
+                        </button>
+
+                        <button
+                            onClick={() => router.push('/ops_admin?tab=graph')}
+                            className="bg-button-secondary text-text-primary px-3 py-1.5 rounded-xl text-xs font-medium hover:bg-bg-tertiary transition-all border border-border-default flex items-center gap-1.5 focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none outline-none cursor-pointer"
+                        >
+                            <Network size={14} className="text-purple-400" />
+                            <span className="hidden sm:inline">Knowledge Graph</span>
                         </button>
 
                         <button
