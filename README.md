@@ -1,6 +1,6 @@
 # Kairo - Enterprise Support Copilot
 
-Kairo is an enterprise-grade customer support assistant and documentation retrieval platform. It integrates a deterministic FAQ matching layer, a dense passage retrieval (RAG) system, and an automated web search fallback with analytics logging. 
+Kairo is an enterprise-grade customer support assistant and documentation retrieval platform. It integrates a deterministic FAQ matching layer, a dense passage retrieval (RAG) system, and an automated web search fallback with analytics logging.
 
 The architecture consists of a Next.js (TypeScript/Tailwind CSS) frontend communicating with a FastAPI backend, supported by SQLite for structural relational data and ChromaDB for vector retrieval.
 
@@ -10,17 +10,17 @@ The architecture consists of a Next.js (TypeScript/Tailwind CSS) frontend commun
 
 ```mermaid
 graph TD
-    User[Support Agent / Administrator] -->|Web UI| FE[Next.js Frontend]
-    FE -->|HTTP Requests / JWT Auth| BE[FastAPI Backend]
-    
-    subgraph Backend Services
-        BE -->|User & Ticket State| DB[(SQLite Database)]
-        BE -->|Settings Persistence| SM[Settings Manager JSON]
-        BE -->|Activity Logger| AL[Activity Logs JSON]
-        BE -->|Similarity Search| VS[(Chroma Vector Store)]
-        BE -->|Web Search Fallback| Exa[Exa Search API]
-        BE -->|LLM Inference| OR[OpenRouter API]
-    end
+ User[Support Agent / Administrator] -->|Web UI| FE[Next.js Frontend]
+ FE -->|HTTP Requests / JWT Auth| BE[FastAPI Backend]
+
+ subgraph Backend Services
+ BE -->|User & Ticket State| DB[(SQLite Database)]
+ BE -->|Settings Persistence| SM[Settings Manager JSON]
+ BE -->|Activity Logger| AL[Activity Logs JSON]
+ BE -->|Similarity Search| VS[(Chroma Vector Store)]
+ BE -->|Web Search Fallback| Exa[Exa Search API]
+ BE -->|LLM Inference| OR[OpenRouter API]
+ end
 ```
 
 ---
@@ -94,15 +94,15 @@ correct `setup_token`.
 
 ```jsonc
 {
-  "answer": "Tighten the gland follower bolts to 40 Nm [1].",
-  "message_id": 14,
-  "confidence": 0.667,          // 0-1, blends match strength with corroboration
-  "source_type": "documents",   // documents | web | faq | none
-  "citations": [
-    { "index": 1, "document": "SOP-PUMP-114.pdf", "page": 2,
-      "snippet": "…tightened to 40 Nm in a diagonal…", "score": 0.8,
-      "doc_id": 3, "url": null }
-  ]
+ "answer": "Tighten the gland follower bolts to 40 Nm [1].",
+ "message_id": 14,
+ "confidence": 0.667, // 0-1, blends match strength with corroboration
+ "source_type": "documents", // documents | web | faq | none
+ "citations": [
+ { "index": 1, "document": "SOP-PUMP-114.pdf", "page": 2,
+ "snippet": "…tightened to 40 Nm in a diagonal…", "score": 0.8,
+ "doc_id": 3, "url": null }
+ ]
 }
 ```
 
@@ -134,46 +134,46 @@ A thread-safe logger records administrative actions:
 
 ### 1. Backend Configuration
 1. Navigate to the backend directory:
-   ```bash
-   cd Backend
-   ```
+ ```bash
+ cd Backend
+ ```
 2. Set up a Python virtual environment:
-   ```bash
-   python -m venv venv
-   # Activate on Windows:
-   .\venv\Scripts\activate
-   # Activate on macOS/Linux:
-   source venv/bin/activate
-   ```
+ ```bash
+ python -m venv venv
+ # Activate on Windows:
+ .\venv\Scripts\activate
+ # Activate on macOS/Linux:
+ source venv/bin/activate
+ ```
 3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+ ```bash
+ pip install -r requirements.txt
+ ```
 4. Create a `.env` file in the **project root** (see `.env.example` for the full list):
-   ```env
-   OPENROUTER_API_KEY=your_openrouter_api_key
-   EXA_API_KEY=your_exa_api_key
+ ```env
+ OPENROUTER_API_KEY=your_openrouter_api_key
+ EXA_API_KEY=your_exa_api_key
 
-   # Required — the app refuses to start without it.
-   # Generate with: python -c "import secrets; print(secrets.token_urlsafe(48))"
-   SECRET_KEY=your_jwt_secret_key
+ # Required — the app refuses to start without it.
+ # Generate with: python -c "import secrets; print(secrets.token_urlsafe(48))"
+ SECRET_KEY=your_jwt_secret_key
 
-   # Origins allowed to call the API (comma-separated)
-   ALLOWED_ORIGINS=http://localhost:3000
+ # Origins allowed to call the API (comma-separated)
+ ALLOWED_ORIGINS=http://localhost:3000
 
-   # Only needed to create the very first manager account
-   ADMIN_SETUP_TOKEN=some-one-time-token
-   ```
+ # Only needed to create the very first manager account
+ ADMIN_SETUP_TOKEN=some-one-time-token
+ ```
 5. Launch the FastAPI server:
-   ```bash
-   uvicorn app:app --reload --port 8000
-   ```
-   *Server runs at `http://localhost:8000`*
+ ```bash
+ uvicorn app:app --reload --port 8000
+ ```
+ *Server runs at `http://localhost:8000`*
 
 6. Run the API regression suite (no API credits consumed):
-   ```bash
-   python test_api.py
-   ```
+ ```bash
+ python test_api.py
+ ```
 
 #### Creating the first manager account
 
@@ -184,21 +184,21 @@ manager exists, further accounts are created by a signed-in manager via
 
 ### 2. Frontend Configuration
 1. Navigate to the `frontend` directory:
-   ```bash
-   cd frontend
-   ```
+ ```bash
+ cd frontend
+ ```
 2. Install npm packages:
-   ```bash
-   npm install
-   ```
+ ```bash
+ npm install
+ ```
 3. Create a `.env.local` file (see `.env.local.example`):
-   ```env
-   NEXT_PUBLIC_API_URL=http://localhost:8000
-   ```
+ ```env
+ NEXT_PUBLIC_API_URL=http://localhost:8000
+ ```
 4. Run the Next.js development server:
-   ```bash
-   npm run dev
-   ```
+ ```bash
+ npm run dev
+ ```
 5. Access the user interface at `http://localhost:3000`.
 
 ---
