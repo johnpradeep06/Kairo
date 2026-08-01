@@ -1,0 +1,26 @@
+[
+    {
+        "username": "admin",
+        "action": "Login",
+        "target": "Test Client",
+        "timestamp": "2026-07-19T16:00:29.930985Z"
+    },
+    {
+        "username": "admin",
+        "action": "Upload",
+        "target": "docs.pdf",
+        "timestamp": "2026-07-19T16:00:29.931166Z"
+    },
+    {
+        "username": "admin4",
+        "action": "Login",
+        "target": null,
+        "timestamp": "2026-07-19T16:02:34.481252Z"
+    },
+    {
+        "username": "admin4",
+        "action": "Login",
+        "target": null,
+        "timestamp": "2026-07-19T16:38:40.932696Z"
+    }
+]
