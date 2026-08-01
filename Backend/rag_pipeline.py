@@ -786,6 +786,17 @@ def rag_answer(
             )
 
     context, citations, highest_score = retrieve_context(search_query)
+    source_type = "documents"
+
+    # Integrate Knowledge Graph Traversal & Subgraph Context Assembly (Graph RAG)
+    try:
+        from graph_service import graph_service
+        graph_res = graph_service.query_graph_rag(search_query)
+        if graph_res and graph_res.subgraph.nodes:
+            context = f"{context}\n\n=== COMPLIANCE KNOWLEDGE GRAPH FACTS ===\n{graph_res.graph_context}".strip()
+            source_type = "hybrid"
+    except Exception as g_err:
+        print(f"Knowledge Graph retrieval failed in rag_answer: {g_err}")
 
     chain = prompt | llm | StrOutputParser()
     answer = clean_answer(chain.invoke({
@@ -797,7 +808,7 @@ def rag_answer(
     answer_lower = answer.lower()
     refused = any(trigger in answer_lower for trigger in _FALLBACK_TRIGGERS)
 
-    source_type = "documents"
+    source_type = "hybrid" if source_type == "hybrid" else "documents"
     confidence = _confidence_from(highest_score, citations)
 
     # 3. Web fallback — clearly labelled, never blended with document answers

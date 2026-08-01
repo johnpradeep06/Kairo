@@ -1,12 +1,12 @@
-# System Architecture & Technical Report: Kairo
+    # System Architecture & Technical Report: Kairo
 
-This report provides a comprehensive technical breakdown of Kairo, an enterprise-grade customer support assistant, RAG (Retrieval-Augmented Generation) engine, and FAQ routing platform. This document is compiled to provide an incoming Master Engineer with a complete structural, architectural, and operational understanding of the system.
+This report provides a comprehensive technical breakdown of Kairo, an enterprise-grade customer support assistant, document compliance auditor, and multi-modal Knowledge Graph RAG (Retrieval-Augmented Generation) engine. This document is compiled to provide an incoming Master Engineer with a complete structural, architectural, and operational understanding of the system.
 
 ---
 
 ## 1. System Overview & Architecture
 
-Kairo is built on a client-server architecture, consisting of a Next.js (TypeScript/Tailwind CSS) frontend and a FastAPI (Python) backend. Persisted storage is split between a relational SQLite database (managed via SQLAlchemy ORM) for user, chat, FAQ, and analytics states, and a local Chroma vector database for semantic document retrieval.
+Kairo is built on a client-server architecture, consisting of a Next.js (TypeScript/Tailwind CSS) frontend and a FastAPI (Python) backend. Persisted storage is split between a relational SQLite database (managed via SQLAlchemy ORM) for user, chat, FAQ, and analytics states, a local Chroma vector database for semantic document retrieval, and a Neo4j Graph Database (with a local SQLite fallback) for entity-relationship semantic tracking.
 
 ### Architectural Blueprint
 
@@ -19,6 +19,7 @@ graph TD
         BE -->|User, FAQ, Session & Audit State| DB[(SQLite Database)]
         BE -->|System Settings| SM[Settings Manager JSON]
         BE -->|Vector Similarity Retrieval| Chroma[(Chroma Vector Store)]
+        BE -->|Entity Relations Graph| KG[(Neo4j Graph Store / SQLite Fallback)]
         BE -->|Web Search Fallback| Exa[Exa Search API]
         BE -->|Model Inference / Completion| OpenRouter[OpenRouter API]
     end
@@ -27,18 +28,20 @@ graph TD
 ### Core Execution Workflows
 
 1. **User Authentication**: Relies on OAuth2 Password Bearer flow. Relational database tables track credentials. Cryptographic hashing is managed using bcrypt. Access tokens are short-lived JSON Web Tokens (JWT).
-2. **Canned FAQ Matching**: Operates as a deterministic pre-flight routing layer. Before querying vector databases or generating LLM completions, user questions are parsed against active FAQ rules in SQLite. The system implements a longest-prefix matching strategy to select the most specific keyword rule. If matched, the canned response is returned immediately, reducing latency to sub-millisecond ranges and bypassing API costs.
+2. **Canned FAQ Matching**: Operates as a deterministic pre-flight routing layer. Before querying vector databases, running graph RAG, or generating LLM completions, user questions are parsed against active FAQ rules in SQLite. The system implements a longest-prefix matching strategy to select the most specific keyword rule. If matched, the canned response is returned immediately, reducing latency to sub-millisecond ranges and bypassing API costs.
 3. **Semantic Knowledge Retrieval (RAG)**: If no FAQ keyword matches, the system performs a vector search in ChromaDB. Retrieved chunks are filtered using a strict similarity threshold (default: 0.15). If valid chunks exist, they are passed as context to the primary LLM (via OpenRouter) to compile a grounded answer.
-4. **Adaptive Web Search Fallback**: If local document context is sparse or if the primary LLM generates a refusal message (e.g. containing phrases like "don't know"), the query is verified for support relevance. If validated, the pipeline queries the Exa Neural Search API to fetch high-quality online documentation, manufacturer manuals, or external guides, returning them with verified inline citations.
-5. **Multi-Agent Research Pipeline**: For advanced search operations, the system runs a 3-agent orchestration flow:
+4. **Knowledge Graph RAG (Graph RAG)**: Complimenting vector RAG, Kairo extracts a semantic network of entity relationships (e.g. Regulation, Policy, Control, Risk, Asset) from document chunks. Seed entities are extracted from the user question and used to traverse the graph at a configurable depth, building an evidentiary context block that is passed to the LLM.
+5. **Adaptive Web Search Fallback**: If local document and graph contexts are sparse, or if the primary LLM generates a refusal message (e.g. containing phrases like "don't know"), the query is verified for support relevance. If validated, the pipeline queries the Exa Neural Search API to fetch high-quality online documentation, manufacturer manuals, or external guides, returning them with verified inline citations.
+6. **Multi-Agent Research Pipeline**: For advanced search operations, the system runs a 3-agent orchestration flow:
     - **Researcher Agent**: Retrieves documents or falls back to web searches, extracting raw factual atomic claims.
     - **Verification Agent**: Audits every claim against raw sources to check for hallucinations, categorizing each claim as SUPPORTED, CONTRADICTED, or UNVERIFIED.
     - **Synthesis Agent**: Compiles the final report in clean markdown, populating a Claim Verification Matrix and computing a holistic Trust Index.
 
 ---
 
-## 2. Relational Database Schema (SQLite)
+## 2. Relational & Graph Database Schemas
 
+### SQLite Relational Database (`users.db`)
 The SQLite database (`users.db` located under the `Backend` directory) manages relational integrity. The primary tables are structured as follows:
 
 ```mermaid
@@ -98,6 +101,59 @@ erDiagram
     chat_sessions ||--o{ chat_messages : "contains"
 ```
 
+### Knowledge Graph Stores
+
+#### Primary Neo4j Database
+* **Nodes**: Represent compliance ontology entities labeled `:Entity` containing properties:
+  - `id` (UUID, Primary Key, Enforced Unique Constraint)
+  - `canonical_name` (canonical normalized string representation, Indexed)
+  - `aliases` (array of alternative nomenclature string names)
+  - `entity_type` (Regulation, Policy, Requirement, Control, Risk, Evidence, Department, Employee, Vendor, Asset, System, Procedure, Audit, Document)
+* **Edges**: Represent relationships matching the compliance ontology:
+  - `-[:IMPLEMENTS]->`
+  - `-[:SATISFIES]->`
+  - `-[:MITIGATES]->`
+  - `-[:OWNS]->`
+  - `-[:REFERENCES]->`
+  - `-[:AUDITS]->`
+  - `-[:DEPENDS_ON]->`
+  - `-[:GENERATED_BY]->`
+  - `-[:VIOLATES]->`
+  - `-[:RELATED_TO]->`
+* **Provenance Properties**: Edges and node-to-document metadata track source attribution:
+  - `document_id`
+  - `chunk_id`
+  - `page_number`
+  - `source_text`
+
+#### SQLite Graph Fallback Database (`kairo_graph_fallback.db`)
+In the event that the Neo4j driver package is missing or connection to the Neo4j database endpoint fails, Kairo switches to a persistent local SQLite fallback graph database containing three tables:
+1. **`entities`**:
+   - `id` (TEXT, Primary Key)
+   - `canonical_name` (TEXT, Unique Index)
+   - `aliases` (TEXT, Comma-separated)
+   - `entity_type` (TEXT)
+   - `document_id` (TEXT)
+   - `page_number` (INTEGER)
+   - `chunk_id` (TEXT)
+   - `source_text` (TEXT)
+2. **`relationships`**:
+   - `id` (INTEGER, Primary Key, Autoincrement)
+   - `source` (TEXT, references `entities.canonical_name`)
+   - `target` (TEXT, references `entities.canonical_name`)
+   - `relation` (TEXT)
+   - `confidence` (REAL)
+   - `extraction_method` (TEXT)
+   - `document_id` (TEXT)
+   - `chunk_id` (TEXT)
+3. **`provenance`**:
+   - `id` (INTEGER, Primary Key, Autoincrement)
+   - `entity_id` (TEXT, references `entities.id`)
+   - `document_id` (TEXT)
+   - `page_number` (INTEGER)
+   - `chunk_id` (TEXT)
+   - `source_text` (TEXT)
+
 ---
 
 ## 3. Configuration & Environment Setup
@@ -133,11 +189,19 @@ ALLOWED_ORIGINS=http://localhost:3000
 
 # --- Maximum Document Upload Size ---
 MAX_UPLOAD_MB=50
+
+# --- Neo4j Graph Database Configuration ---
+# Set connection parameters for the Neo4j instance.
+# If Neo4j is offline or these are not set, Kairo automatically falls back to a 
+# persistent local SQLite graph database (Backend/kairo_graph_fallback.db).
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=password
 ```
 
 ---
 
-## 4. Operational Instructions: Running the System
+## 4. Operational Instructions: Running & Testing Kairo
 
 ### Running the Backend
 
@@ -184,18 +248,33 @@ MAX_UPLOAD_MB=50
     ```
 5. Open your browser and navigate to `http://localhost:3000`.
 
+### System Verification & Tests
+Kairo provides three automated testing suites inside the `Backend` directory:
+* **Base Grounding Verification**: Tests vector database retrieval relevance score cutoffs and LLM grounding prompts.
+  ```bash
+  python test_grounding.py
+  ```
+* **API Endpoints Verification**: Tests registration flows, admin JWT authorization, FAQ canned rules, and analytics response schemas.
+  ```bash
+  python test_api.py
+  ```
+* **Knowledge Graph Verification**: Verifies canonical entity resolution, Pydantic domain models, LLM structured JSON extraction, and Neo4j repository connectivity/SQLite fallback operations.
+  ```bash
+  python test_knowledge_graph.py
+  ```
+
 ---
 
 ## 5. Summary of Implemented Features
 
 1. **Deterministic FAQ Matcher**: Configurable via the manager panel. Bypasses the vector store and LLM entirely for matched keywords. Evaluates multiple keyword rules, selecting the longest matching keyword to ensure high accuracy.
 2. **Hybrid RAG Retrieval**: Queries local ChromaDB vectors. Uses a similarity threshold cutoff (0.15) below which context chunks are ignored. Falls back dynamically to the Exa Web Search API if local documents do not contain relevant details.
-3. **Multi-Agent Orchestration Flow**: Implemented a 3-agent cooperative research, auditing, and compilation pipeline. Real-time updates, agent thoughts, and tool execution steps are streamed to the frontend via Server-Sent Events (SSE).
-4. **Knowledge Gap Analytics**: Automatically captures queries that fail vector similarity threshold checks. Persists them into SQLite `failed_retrievals` and exposes an aggregated gap report in the manager panel, outlining which search topics need new documentation.
-5. **Secure Authentication & Session Cache**: Includes password hashing (bcrypt), JSON Web Tokens (JWT), and role-based path validation. Chat session histories are saved to SQLite and automatically cascade-delete associated messages when a session is deleted.
-6. **Rebranded Workspace Terminology**: Terminology throughout the backend, frontend, and document files has been updated to reflect "Kairo" and aligned with customer support roles:
-    - Managers / Admins: Can configure settings, FAQ rules, upload files, and audit logs.
-    - Support Agents: Can run chat sessions and query the assistant.
+3. **Enterprise Compliance Knowledge Graph**: Automatically extracts ontology-based entity relationships from uploaded files using structured LLM JSON parser prompts. Consolidated aliases automatically resolve names like "ISO-27001" to the canonical "ISO 27001". Exposes graphical nodes and edges to the frontend.
+4. **Visual Network Graph**: Displays the visual network map directly in the manager control panel using a React Flow canvas with Dagre auto-layout.
+5. **10-Stage Ingestion Progress Logging**: Logs background extraction, entity resolution, and graph storage queries in 10 explicit logging stages.
+6. **SQLite Graph Fallback Repository**: Provides instant data-safety backup that captures entities and relationships in SQLite if a Neo4j database endpoint is unavailable.
+7. **Knowledge Gap Analytics**: Automatically captures queries that fail vector similarity threshold checks. Persists them into SQLite `failed_retrievals` and exposes an aggregated gap report in the manager panel, outlining which search topics need new documentation.
+8. **Secure Authentication & Session Cache**: Includes password hashing (bcrypt), JSON Web Tokens (JWT), and role-based path validation. Chat session histories are saved to SQLite and automatically cascade-delete associated messages when a session is deleted.
 
 ---
 
@@ -213,10 +292,10 @@ During review and development, the following system limitations were identified:
    - *Implication*: Any website can make authenticated requests to this API, which constitutes a security risk (cross-origin request forgery vulnerability).
    - *Recommended Fix*: Restrict the CORS origin patterns to match only trusted production and staging domains.
 
-3. **SQLite Concurrency & Multi-Process Database Locks**:
-   - *Problem*: Kairo uses SQLite for persistent storage. SQLite databases do not scale well with concurrent writes.
-   - *Implication*: During high concurrency (e.g. multiple agents writing chat histories, analytics telemetry, and audit logs simultaneously), SQLite can trigger write-locks, raising `sqlite3.OperationalError` and causing requests to fail.
-   - *Recommended Fix*: Use PostgreSQL for production multi-worker environments. Update the `DATABASE_URL` environment parameter accordingly.
+3. **SQLite Write Concurrency and Locks**:
+   - *Problem*: Kairo uses SQLite for persistent storage (including the graph database fallback). SQLite databases do not scale well with concurrent writes.
+   - *Implication*: During high concurrency (e.g. multiple threads writing parsed chunks to the graph database fallback, writing chat histories, and analytics telemetry simultaneously), SQLite can trigger write-locks, raising `sqlite3.OperationalError` and causing ingestions or requests to fail.
+   - *Recommended Fix*: Use PostgreSQL and a managed Neo4j instance for production deployments.
 
 4. **Web Search Fallback Trigger Sensitivity**:
    - *Problem*: The Exa search fallback is triggered when local vector store similarity scores are below 0.15, or when the LLM outputs a refusal message containing the string "don't know".

@@ -185,6 +185,26 @@ def run_multi_agent_pipeline_stream(
         "content": f"Vector DB search complete. Retrieved {len(citations)} document chunk(s) with max similarity score {round(highest_score, 3)}."
     }
 
+    # Integrate Knowledge Graph Traversal & Subgraph Context Assembly (Graph RAG)
+    try:
+        from graph_service import graph_service
+        yield {
+            "type": "thought",
+            "agent": "Researcher Agent",
+            "content": "Executing Knowledge Graph traversal around query compliance seeds..."
+        }
+        graph_res = graph_service.query_graph_rag(question)
+        if graph_res and graph_res.subgraph.nodes:
+            yield {
+                "type": "thought",
+                "agent": "Researcher Agent",
+                "content": f"Graph RAG traversal complete. Retrieved {len(graph_res.subgraph.nodes)} entity nodes and {len(graph_res.subgraph.edges)} edges."
+            }
+            context = f"{context}\n\n=== COMPLIANCE KNOWLEDGE GRAPH FACTS ===\n{graph_res.graph_context}".strip()
+            source_type = "hybrid"
+    except Exception as g_err:
+        logger.warning(f"Knowledge Graph retrieval in multi-agent pipeline failed: {g_err}")
+
     # Fallback to Exa Web Search if local context is sparse or irrelevant
     if not context or not citations or highest_score < RELEVANCE_THRESHOLD:
         yield {

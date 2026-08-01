@@ -11,7 +11,7 @@ Includes a persistent SQLite fallback if Neo4j instance is offline.
 import os
 import sqlite3
 import logging
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Tuple
 from contextlib import contextmanager
 
 from graph_models import (
@@ -355,23 +355,112 @@ class Neo4jGraphRepository:
         import json
         nodes_map: Dict[str, GraphNode] = {}
         edges_list: List[GraphEdge] = []
+        
+        normalized_seeds = {s.lower().strip() for s in seed_names}
+        if not normalized_seeds:
+            return SubGraph()
+            
         with sqlite3.connect(self._fallback_db_path) as conn:
             cursor = conn.cursor()
+            
             cursor.execute("SELECT id, canonical_name, aliases, entity_type FROM entities")
+            all_entities = {}
             for row in cursor.fetchall():
                 eid, name, aliases_json, etype = row
-                nodes_map[name] = GraphNode(id=eid, label=name, type=etype, aliases=json.loads(aliases_json or "[]"))
-
-            cursor.execute("SELECT id, source, target, relation, confidence, document_id FROM relationships LIMIT ?", (max_nodes,))
-            for r in cursor.fetchall():
-                rid, src, tgt, rel, conf, doc_id = r
-                edges_list.append(GraphEdge(id=str(rid), source=src, target=tgt, relation=rel, confidence=conf, document_id=doc_id))
-                if src not in nodes_map:
-                    nodes_map[src] = GraphNode(id=src, label=src, type="Requirement", aliases=[])
-                if tgt not in nodes_map:
-                    nodes_map[tgt] = GraphNode(id=tgt, label=tgt, type="Requirement", aliases=[])
-
-        return SubGraph(nodes=list(nodes_map.values()), edges=edges_list)
+                aliases = json.loads(aliases_json or "[]")
+                all_entities[name] = {
+                    "id": eid,
+                    "canonical_name": name,
+                    "aliases": aliases,
+                    "entity_type": etype
+                }
+            
+            visited_nodes = set()
+            for name, data in all_entities.items():
+                name_match = name.lower() in normalized_seeds
+                alias_match = any(a.lower() in normalized_seeds for a in data["aliases"])
+                if name_match or alias_match:
+                    visited_nodes.add(name)
+            
+            if not visited_nodes:
+                for name in all_entities.keys():
+                    if any(seed in name.lower() or name.lower() in seed for seed in normalized_seeds):
+                        visited_nodes.add(name)
+            
+            cursor.execute("SELECT id, source, target, relation, confidence, document_id FROM relationships")
+            all_rels = []
+            for row in cursor.fetchall():
+                rid, src, tgt, rel, conf, doc_id = row
+                all_rels.append({
+                    "id": rid,
+                    "source": src,
+                    "target": tgt,
+                    "relation": rel,
+                    "confidence": conf,
+                    "document_id": doc_id
+                })
+            
+            current_level = set(visited_nodes)
+            traversed_edges = []
+            
+            for d in range(depth):
+                next_level = set()
+                for rel in all_rels:
+                    src = rel["source"]
+                    tgt = rel["target"]
+                    
+                    if src in current_level or tgt in current_level:
+                        edge_obj = GraphEdge(
+                            id=str(rel["id"]),
+                            source=src,
+                            target=tgt,
+                            relation=rel["relation"],
+                            confidence=rel["confidence"],
+                            document_id=rel["document_id"]
+                        )
+                        if edge_obj not in traversed_edges:
+                            traversed_edges.append(edge_obj)
+                            
+                        if src not in visited_nodes:
+                            next_level.add(src)
+                            visited_nodes.add(src)
+                        if tgt not in visited_nodes:
+                            next_level.add(tgt)
+                            visited_nodes.add(tgt)
+                            
+                current_level = next_level
+                if not current_level:
+                    break
+                    
+            for name in visited_nodes:
+                if name in all_entities:
+                    data = all_entities[name]
+                    nodes_map[name] = GraphNode(
+                        id=data["id"],
+                        label=data["canonical_name"],
+                        type=data["entity_type"],
+                        aliases=data["aliases"]
+                    )
+                else:
+                    nodes_map[name] = GraphNode(
+                        id=name,
+                        label=name,
+                        type="Requirement",
+                        aliases=[]
+                    )
+            
+            edges_list = traversed_edges[:max_nodes]
+            active_node_names = set(visited_nodes)
+            for edge in edges_list:
+                active_node_names.add(edge.source)
+                active_node_names.add(edge.target)
+                
+            final_nodes = {}
+            for name in active_node_names:
+                if name in nodes_map:
+                    final_nodes[name] = nodes_map[name]
+            
+        return SubGraph(nodes=list(final_nodes.values()), edges=edges_list)
 
     def delete_document_graph(self, document_id: Union[str, int]) -> int:
         """Remove all relationships and orphan nodes associated with a document ID."""
