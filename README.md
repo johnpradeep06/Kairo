@@ -1,232 +1,210 @@
-# Kairo - Enterprise Compliance & Support Knowledge Graph Copilot
+# Kairo — Enterprise Compliance & Support Knowledge Copilot
 
-Kairo is an enterprise-grade customer support assistant, document compliance auditor, and multi-modal knowledge graph RAG (Retrieval-Augmented Generation) platform. It integrates a deterministic FAQ matching layer, a dense passage retrieval (RAG) system, an enterprise compliance Neo4j Knowledge Graph (with persistent SQLite fallback), and an automated web search fallback with analytics logging.
+Kairo is a compliance and support assistant for organizations that sit on top of a pile of unstructured policy documents — PDFs, Word docs, even audio recordings of audits — and need a way to *ask questions* of that pile and trust the answer.
 
-The architecture consists of a Next.js (TypeScript/Tailwind CSS) frontend communicating with a FastAPI backend. Structured relational data is stored in SQLite, vector indexes in ChromaDB, and entity relationship graphs in Neo4j (or SQLite fallback).
+It does three things most simple "chat with your PDF" tools don't:
+
+1. **Answers are grounded, not guessed.** Every claim in an answer is traced back to a specific document, page, and chunk. Low-confidence or unsupported answers are flagged instead of stated with false confidence.
+2. **It doesn't just retrieve text, it builds a knowledge graph.** Documents are parsed into a network of compliance entities (regulations, controls, risks, vendors, systems...) and the relationships between them, so you can ask relationship questions ("which vendor manages infrastructure connected to the Finance Server?") that plain text search can't answer.
+3. **Answers get independently audited.** A second, separate AI agent (via Lyzr Studio) checks a Kairo-generated answer against the same evidence and reports whether every claim actually holds up — a real second opinion, not the same model re-checking its own work.
 
 ---
 
-## System Architecture
+## Who it's for
+
+A manager/admin uploads the organization's compliance documents. Technicians (support agents) then chat with Kairo to answer customer or internal questions, backed by those documents, with citations and confidence scores attached to every answer.
+
+---
+
+## How a question gets answered
+
+Kairo doesn't send every question straight to an LLM. A question is routed through several layers, cheapest and most deterministic first:
 
 ```mermaid
 graph TD
-    User[Support Agent / Manager] -->|Web UI| FE[Next.js Frontend]
-    FE -->|HTTP Requests / JWT Auth| BE[FastAPI Backend]
-    
+    Q[User Question] --> FAQ{Matches a canned<br/>FAQ keyword?}
+    FAQ -- yes --> A1[Instant deterministic answer]
+    FAQ -- no --> Intent{Intent classification}
+    Intent -- relationship / graph question --> Graph[Knowledge Graph traversal]
+    Intent -- factual lookup --> Vector[Vector similarity search]
+    Graph --> Evidence
+    Vector --> Evidence
+    Evidence[Retrieved evidence] --> Grounded{Evidence found<br/>above threshold?}
+    Grounded -- no --> Web[Exa web search fallback]
+    Grounded -- yes --> LLM[LLM answer, grounded in evidence]
+    Web --> LLM
+    LLM --> Verify[Per-claim hallucination check]
+    Verify --> Out[Answer + citations + confidence]
+```
+
+1. **FAQ layer** — a deterministic keyword-match table that short-circuits common questions before any AI call is made. Instant, free, and predictable.
+2. **Retrieval layer** — for everything else, Kairo decides whether the question is a relationship question (routed to the knowledge graph) or a factual lookup (routed to vector similarity search over the document corpus).
+3. **Grounding** — if neither retrieval path finds strong enough evidence, Kairo falls back to a live web search (Exa) rather than letting the model answer from memory.
+4. **Answer generation** — the LLM answers strictly from whatever evidence was retrieved, with inline citation markers.
+5. **Self-verification** — every generated claim is checked sentence-by-sentence against the retrieved evidence and labeled `SUPPORTED`, `CONTRADICTED`, or `UNVERIFIED / HALLUCINATED`, feeding an overall trust score shown alongside the answer.
+6. **Independent audit (optional)** — on top of Kairo's own self-check, a completely separate agent (Lyzr Studio) can be asked to re-verify the same answer against the same evidence, with no access to Kairo's reasoning. See below.
+
+---
+
+## Core modules
+
+### 1. Deterministic FAQ router
+Keyword rules configured by an admin are checked before any retrieval or LLM call. If multiple rules match, the longest matching keyword wins. This keeps common questions instant and keeps token spend down.
+
+### 2. Document ingestion & Retrieval-Augmented Generation (RAG)
+Admins upload PDFs, Word documents, plain text, or **audio recordings** (automatically transcribed via Groq Whisper before indexing). Documents are chunked, embedded, and stored in a persistent ChromaDB vector index. Questions are answered by retrieving the most similar chunks and passing only evidence above a relevance threshold to the LLM — nothing below threshold reaches the model, so a weak match can't masquerade as a confident answer.
+
+### 3. Compliance Knowledge Graph (Graph RAG)
+This is what separates Kairo from a generic document chatbot. Every uploaded document is also run through an LLM extraction pipeline that pulls out compliance entities and the relationships between them:
+
+- **Entity types**: Regulation, Policy, Requirement, Control, Risk, Vendor, Department, Employee, Asset, System, Procedure, Audit, Evidence, Document, Database, Server, Application
+- **Relationship types**: OWNS, IMPLEMENTS, SATISFIES, MITIGATES, PROTECTS, USES, DEPENDS_ON, REFERENCES, AUDITS, GENERATED_BY, RELATED_TO, VIOLATES
+
+Entity resolution consolidates variant names of the same real-world thing ("ISO 27001", "ISO-27001", "ISO/IEC 27001") under one canonical node, and every node carries full **provenance** — the exact document, page, and source text it came from — so any fact in the graph can be traced back to where it was said.
+
+The graph is stored in **Neo4j** when configured, and automatically falls back to a persistent local SQLite store when Neo4j isn't available, so the feature never hard-fails in a low-resource or offline environment.
+
+**Interactive visualization**: the Knowledge Graph tab renders the graph as an explorable node network (force-directed or hierarchical layout). Hovering any node surfaces its type, aliases, connection count, and the exact source text it was extracted from. An empty corpus shows a proper onboarding state (what the pipeline does, what entity types it detects) instead of a blank canvas. A built-in **Graph RAG query box** lets you ask relationship questions directly against the graph and see the traversal path used to answer.
+
+### 4. Independent verification via Lyzr Studio
+Kairo's own multi-agent pipeline already self-checks its answers. On top of that, both the Graph RAG panel and the main chat let you trigger a **second, architecturally separate audit**: the question, the answer, and the retrieved evidence (never the source documents themselves) are sent to a dedicated Lyzr Studio agent whose only job is to judge whether the answer is actually supported by that evidence. It returns a verdict (`SUPPORTED` / `PARTIALLY_SUPPORTED` / `UNSUPPORTED`), a 0–100% hallucination-risk score, and the specific claims it couldn't verify — surfaced in the UI as a "Lyzr Verified" tag with the risk score attached. This exists specifically to answer "how do you know it's not hallucinating?" with something more convincing than "trust the model."
+
+### 5. Web search fallback & knowledge-gap tracking
+When local documents and the graph both come up empty, or the LLM would otherwise refuse to answer, Kairo can fall back to a live Exa web search rather than leaving the user stuck. Every query that fell below the retrieval threshold is logged to a gap-analysis table, so admins can see which topics their document corpus doesn't actually cover yet.
+
+### 6. Multi-agent chat pipeline
+The main chat interface streams responses through a small pipeline (intent routing → evidence retrieval → grounded generation → per-claim verification) rather than a single raw LLM call, so the UI can show live progress and attach a real confidence/trust score to the finished answer instead of a hardcoded number.
+
+### 7. Admin dashboard
+- **Documents** — upload, monitor indexing status in real time, delete, and re-index.
+- **Knowledge Graph** — the interactive graph explorer described above.
+- **FAQ rules** — manage the deterministic keyword-answer table.
+- **Analytics** — knowledge-gap reports (what users asked that the corpus couldn't answer), answer-quality feedback stats (thumbs up/down), and an append-only audit trail of who did what.
+- **Activity log** — logins, uploads, deletions, re-indexing, and FAQ changes.
+- **Support tickets** — a lightweight local triage board for tracking support requests alongside the chat (currently browser-local, not yet backend-persisted).
+
+### 8. Auth & roles
+JWT-based authentication with two roles: **manager** (admin — uploads documents, manages FAQ rules, views analytics) and **technician** (day-to-day chat user). The first manager account is bootstrapped with a one-time setup token so there's no chicken-and-egg problem on a fresh deployment.
+
+---
+
+## Architecture
+
+```mermaid
+graph TD
+    User[Technician / Manager] -->|Web UI| FE[Next.js Frontend]
+    FE -->|HTTP + JWT| BE[FastAPI Backend]
+
     subgraph Backend Services
-        BE -->|User, Session & FAQ State| DB[(SQLite Database)]
-        BE -->|Settings Persistence| SM[Settings Manager JSON]
-        BE -->|Activity Logger| AL[Activity Logs JSON]
-        BE -->|Similarity Search| VS[(Chroma Vector Store)]
-        BE -->|Entity Relations Graph| KG[(Neo4j Graph Store / SQLite Fallback)]
-        BE -->|Web Search Fallback| Exa[Exa Search API]
-        BE -->|LLM Inference| OR[OpenRouter API]
+        BE -->|Users, sessions, FAQ, audit| DB[(SQLite)]
+        BE -->|Document embeddings| VS[(ChromaDB Vector Store)]
+        BE -->|Entities & relationships| KG[(Neo4j / SQLite fallback)]
+        BE -->|Audio transcription| Groq[Groq Whisper]
+        BE -->|Web search fallback| Exa[Exa Search API]
+        BE -->|LLM inference & embeddings| OR[OpenRouter API]
+        BE -->|Independent answer audit| Lyzr[Lyzr Studio Agent]
     end
 ```
 
----
-
-## Core Technical Pipelines
-
-### 1. Canned FAQ Matching Layer
-Prior to vector retrieval, graph queries, or LLM inference, user queries are routed through a canned FAQ matching system.
-* **Deterministic Matching**: Evaluates user questions against active keyword rules stored in the SQLite database.
-* **Longest-Prefix Strategy**: If multiple configured keywords match the input text, the backend selects the rule with the longest matching keyword.
-* **Bypass Execution**: Returns the mapped response immediately, reducing latency to sub-millisecond ranges and avoiding LLM API token consumption.
-
-### 2. Dense Passage Retrieval (RAG)
-For query patterns not matched by the FAQ layer, the backend initiates document retrieval.
-* **Vector Indexing**: Documents (PDF, TXT, DOCX) uploaded by managers are processed, chunked, and saved in a persistent ChromaDB instance.
-* **Embeddings Model**: Utilizes `openai/text-embedding-ada-002` via OpenRouter to generate 1536-dimensional dense vectors.
-* **Context Generation**: Performs similarity searches matching top-K chunks. Only context chunks exceeding the similarity threshold are passed to the language model.
-* **LLM Orchestration**: Combines retrieved context blocks with the system prompt, sending the request to a high-capacity model (e.g., `openai/gpt-oss-120b`) via OpenRouter.
-
-### 3. Enterprise Knowledge Graph RAG (Graph RAG)
-Documents uploaded to Kairo are synthesized into a Compliance Knowledge Graph mapping complex relationships between regulations, policies, requirements, and systems.
-* **10-Stage Ingestion Ingestion logging**: Document ingestion proceeds through 10 strict logging stages:
-  - Stage 1: Upload Completed
-  - Stage 2: Background Task Started
-  - Stage 3: Chunks Received from Parser
-  - Stage 4: graph_builder.extract() Executing for Chunk
-  - Stage 5: LLM Extraction Returned
-  - Stage 6: Entity Resolution Consolidated
-  - Stage 7: graph_repository.save() Executing
-  - Stage 8: Graph MERGE Queries Succeeded
-  - Stage 9: Graph Statistics Refreshed
-  - Stage 10: Ingestion Completed
-* **Entity Resolution**: Normalized entity names consolidates variant names (e.g., "ISO 27001", "ISO-27001", "ISO/IEC 27001") under a single canonical UUID to build clean visual network maps.
-* **Ontology Matching**: Extracts specific entities (Regulation, Policy, Requirement, Control, Risk, Asset) and relationships (IMPLEMENTS, SATISFIES, MITIGATES, REFERENCES, VIOLATES).
-* **SQLite Fallback**: If a Neo4j database is not configured or goes offline, Kairo automatically falls back to a persistent local SQLite graph database (`kairo_graph_fallback.db`).
-
-### 4. Adaptive Web Fallback & Gap Analytics
-If the vector store or graph retrieval yields no results or if similarity scores fall below the specified threshold:
-* **Context Refusal Detection**: If the LLM generates a refusal message (e.g., "Sorry, I don't know based on the given context"), or if retrieval scores are low, the fallback trigger is activated.
-* **Exa Web Search**: Conducts an external web search using Exa API, routing response summaries and verified citations back to the agent.
-* **Knowledge Gap Logging**: Records the failed query, its highest similarity score, and the fallback status to the `failed_retrievals` table. Managers can view these gap reports to identify missing documentation areas.
+**Stack**: Next.js (TypeScript, Tailwind) frontend · FastAPI (Python) backend · ChromaDB for vectors · Neo4j (with SQLite fallback) for the knowledge graph · SQLite for relational/user data.
 
 ---
 
-## Dynamic Configuration Engine
+## Setup guide
 
-Administrators can modify system settings in real time via the Advanced Settings panel. Configurations are persisted in `settings.json`:
-* **Chunk Parameters**: Adjust `chunk_size` and `chunk_overlap` for document parsing.
-* **Retrieval Limits**: Tune `top_k` (number of chunks retrieved) and `max_context_chunks`.
-* **Similarity Threshold**: Define the minimum relevance score required to accept local document context.
-* **Inference Temperature**: Tweak the creativity/determinism of the LLM responses.
-* **Feature Toggles**: Enable/disable the FAQ Router, Exa Web Fallback, or Failed Retrievals Logging.
-* **System Prompt Editor**: Edit instructions dynamically without restarting the FastAPI service.
+### Prerequisites
+- Python 3.11+
+- Node.js 18+
+- API keys: [OpenRouter](https://openrouter.ai) (LLM + embeddings, required), [Exa](https://exa.ai) (web fallback, optional), [Groq](https://groq.com) (audio transcription, optional), [Lyzr Studio](https://studio.lyzr.ai) (independent verification, optional)
+- A Neo4j instance (optional — the graph feature works without one, via an automatic SQLite fallback)
 
----
-
-## API Reference
-
-### User Authentication & Management
-| Method | Endpoint | Description | Auth Required |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/register` | Create a new technician account | No |
-| `POST` | `/register_admin` | Bootstrap the first manager (needs `ADMIN_SETUP_TOKEN`) | No\* |
-| `POST` | `/admin/users` | Create further accounts of either role | Yes (Admin) |
-| `POST` | `/token` | Authenticate user (returns JWT) | No |
-| `GET` | `/users/me` | Fetch active user information | Yes |
-
-### Document Corpus Management
-| Method | Endpoint | Description | Auth Required |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/upload` | Upload a document; indexing runs in the background (202) | Yes (Admin) |
-| `GET` | `/files` | List the corpus with per-document indexing status | Yes (Admin) |
-| `GET` | `/files/{doc_id}/status` | Poll indexing progress for one document | Yes (Admin) |
-| `DELETE` | `/files/{filename}` | Delete a document and purge its embeddings | Yes (Admin) |
-| `POST` | `/reindex/{filename}` | Re-index a document in the background | Yes (Admin) |
-
-### Deterministic FAQ Rules
-| Method | Endpoint | Description | Auth Required |
-| :--- | :--- | :--- | :--- |
-| `GET` | `/faq` | Get list of all canned FAQ rules | Yes (Admin) |
-| `POST` | `/faq` | Add a new canned FAQ rule | Yes (Admin) |
-| `DELETE` | `/faq/{id}` | Remove a canned FAQ rule | Yes (Admin) |
-
-### Knowledge Graph & Graph RAG
-| Method | Endpoint | Description | Auth Required |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/graph/query` | Execute Graph RAG question backed by Neo4j graph context | Yes |
-| `GET` | `/graph/visualize` | Retrieve nodes and edges for visual network graphing | Yes |
-| `GET` | `/graph/stats` | Get node counts, relationship counts, and indexed docs | Yes |
-| `DELETE` | `/graph/documents/{doc_id}` | Purge document graph nodes and edges from the store | Yes (Admin) |
-| `POST` | `/graph/ingest` | Manually trigger Knowledge Graph extraction for a document | Yes (Admin) |
-
-### Analytics & Auditing
-| Method | Endpoint | Description | Auth Required |
-| :--- | :--- | :--- | :--- |
-| `GET` | `/analytics/gaps` | Failed-retrieval analytics & gap reports | Yes (Admin) |
-| `GET` | `/analytics/feedback` | Answer-quality stats from thumbs up/down | Yes (Admin) |
-| `GET` | `/analytics/audit` | Append-only audit trail of queries and actions | Yes (Admin) |
-
-### Chat Sessions
-| Method | Endpoint | Description | Auth Required |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/sessions` | Create a chat session | Yes |
-| `POST` | `/sessions/{id}/ask` | Ask a question — returns answer + citations + confidence | Yes |
-| `GET` | `/sessions/{id}/messages` | Load a conversation with its stored citations | Yes |
-| `POST` | `/messages/{id}/feedback` | Rate an answer `helpful` / `not_helpful` | Yes |
-
-\* Only succeeds while no manager account exists and the request carries the correct `setup_token`.
-
----
-
-## Database Schema & Persistence
-
-### SQLite Tables (`users.db`)
-* **`users`**: Manages credentials, password hashing (bcrypt), and roles.
-* **`chat_sessions`**: Stores user chat sessions, allowing history retention.
-* **`chat_messages`**: Maintains individual message logs associated with sessions.
-* **`faq_rules`**: Stores keyword-to-response mappings and active flags.
-* **`failed_retrievals`**: Tracks search inputs that fell below the similarity threshold.
-
-### Knowledge Graph Persistence
-* **Neo4j DB (Primary)**: Stores entities as graph nodes (e.g. `:Entity {id, canonical_name, aliases, entity_type}`) and relationships as edges (e.g., `-[:MITIGATES]->`).
-* **SQLite fallback (`kairo_graph_fallback.db`)**: Active when Neo4j is offline. Stores data in `entities`, `relationships`, and `provenance` tables.
-
-### Audit Logging (`activity_logs.json`)
-A thread-safe logger records administrative actions:
-* User logins and logouts.
-* Document uploads and deletions.
-* Document re-indexing triggers.
-* FAQ rule modifications.
-
----
-
-## Development Setup
-
-### 1. Backend Configuration
-1. Navigate to the backend directory:
-   ```bash
-   cd Backend
-   ```
-2. Set up up a Python virtual environment:
-   ```bash
-   python -m venv venv
-   # Activate on Windows:
-   .\venv\Scripts\activate
-   # Activate on macOS/Linux:
-   source venv/bin/activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Create a `.env` file in the project root:
-   ```env
-   OPENROUTER_API_KEY=your_openrouter_api_key
-   EXA_API_KEY=your_exa_api_key
-
-   # Required - the app refuses to start without it.
-   SECRET_KEY=your_jwt_secret_key
-
-   ALLOWED_ORIGINS=http://localhost:3000
-   ADMIN_SETUP_TOKEN=some-one-time-token
-
-   # Neo4j Settings (If left empty, the system defaults to SQLite fallback DB)
-   NEO4J_URI=bolt://localhost:7687
-   NEO4J_USER=neo4j
-   NEO4J_PASSWORD=password
-   ```
-5. Launch the FastAPI server:
-   ```bash
-   uvicorn app:app --reload --port 8000
-   ```
-
-### 2. Frontend Configuration
-1. Navigate to the `frontend` directory:
-   ```bash
-   cd frontend
-   ```
-2. Install npm packages:
-   ```bash
-   npm install
-   ```
-3. Create a `.env.local` file:
-   ```env
-   NEXT_PUBLIC_API_URL=http://localhost:8000
-   ```
-4. Run the Next.js development server:
-   ```bash
-   npm run dev
-   ```
-5. Access the user interface at `http://localhost:3000`.
-
----
-
-## System Verification
-
-To run automated checks and verify API and knowledge graph correctness, execute the testing modules in the Backend directory:
+### 1. Backend
 
 ```bash
-# Verify base retrieval and RAG grounding
-python test_grounding.py
+cd Backend
+python -m venv venv
 
-# Verify API authentication, FAQ, and analytics endpoints
-python test_api.py
+# Windows
+.\venv\Scripts\activate
+# macOS/Linux
+source venv/bin/activate
 
-# Verify Entity Resolution, Graph database, and extraction
-python test_knowledge_graph.py
+pip install -r requirements.txt
 ```
+
+Create a `.env` file at the **project root** (one level above `Backend/`):
+
+```env
+# Required
+OPENROUTER_API_KEY=your_openrouter_api_key
+SECRET_KEY=your_jwt_secret_key
+ADMIN_SETUP_TOKEN=some-one-time-token
+ALLOWED_ORIGINS=http://localhost:3000
+
+# Optional — web search fallback
+EXA_API_KEY=your_exa_api_key
+
+# Optional — audio document transcription
+GROQ_API_KEY=your_groq_api_key
+
+# Optional — Neo4j (falls back to a local SQLite graph store if unset)
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=password
+
+# Optional — independent answer verification (Lyzr Studio)
+# Create an agent at studio.lyzr.ai and paste its id below.
+LYZR_API_KEY=your_lyzr_api_key
+LYZR_AGENT_ID=your_lyzr_agent_id
+LYZR_USER_ID=your_lyzr_account_email
+
+# Optional — knowledge-graph extraction concurrency.
+# Lower this if you're on a free/rate-limited LLM tier; parallel extraction
+# calls can silently fail under throttling and degrade graph quality.
+GRAPH_EXTRACTION_WORKERS=2
+```
+
+Start the API:
+
+```bash
+uvicorn app:app --reload --port 8000
+```
+
+The first time you run it, create the initial manager account:
+
+```bash
+python create_admin.py
+```
+
+### 2. Frontend
+
+```bash
+cd frontend
+npm install
+```
+
+Create `frontend/.env.local`:
+
+```env
+NEXT_PUBLIC_API_URL=http://localhost:8000
+```
+
+```bash
+npm run dev
+```
+
+Open `http://localhost:3000`, log in with the manager account you created, upload a document, and try both the chat and the Knowledge Graph tab.
+
+### 3. Verifying the setup
+
+```bash
+cd Backend
+python test_grounding.py        # retrieval & grounding
+python test_api.py              # auth, FAQ, analytics endpoints
+python test_knowledge_graph.py  # entity resolution & graph extraction
+```
+
+### Notes for deployment
+- The backend must bind to whatever port your host injects via `$PORT` (the included `Procfile` already does this) — make sure your platform's public domain/proxy is pointed at the **same** port, not a hardcoded one.
+- `ALLOWED_ORIGINS` must include your deployed frontend's real URL, not just `localhost`, or every browser request will fail CORS even though the API itself is healthy.
+- If `LYZR_API_KEY` / `LYZR_AGENT_ID` / `LYZR_USER_ID` are left unset, the independent-verification feature reports itself as "not configured" in the UI and stays cleanly disabled — it will not error.
