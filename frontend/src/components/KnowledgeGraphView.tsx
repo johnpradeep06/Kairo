@@ -91,6 +91,9 @@ type GraphEdgeData = {
   relation: string;
   confidence: number;
   document_id?: string | number;
+  page_number?: number;
+  chunk_id?: string | number;
+  source_text?: string;
 };
 
 type GraphStats = {
@@ -112,6 +115,9 @@ type GraphRAGResponse = {
     edges: GraphEdgeData[];
   };
   confidence: number;
+  // Free-form tracing payload from the backend's 10-stage debug pipeline; its
+  // shape varies by query path, so it is consumed defensively at each use.
+  debug_info?: Record<string, any> | null;
 };
 
 // =========================================================
@@ -309,7 +315,7 @@ const getClusterLayoutedElements = (nodes: Node[], edges: Edge[]) => {
   });
 
   nodes.forEach((node) => {
-    const label = node.data.label || "";
+    const label = String(node.data.label ?? "");
     const nodeWidth = Math.max(220, Math.min(220 + label.length * 4, 380));
     dagreGraph.setNode(node.id, { width: nodeWidth, height: 110 });
   });
@@ -322,7 +328,7 @@ const getClusterLayoutedElements = (nodes: Node[], edges: Edge[]) => {
 
   const layoutedNodes = nodes.map((node) => {
     const nodeWithPosition = dagreGraph.node(node.id);
-    const label = node.data.label || "";
+    const label = String(node.data.label ?? "");
     const nodeWidth = Math.max(220, Math.min(220 + label.length * 4, 380));
     return {
       ...node,
@@ -343,7 +349,10 @@ const getForceLayoutedElements = (nodes: Node[], edges: Edge[]) => {
   const nodeCount = nodes.length;
   if (nodeCount === 0) return { nodes, edges };
 
-  const layoutedNodes = nodes.map((n) => ({
+  // forceX/forceY are per-iteration scratch accumulators for the simulation,
+  // not part of React Flow's Node contract — declared here so they type-check.
+  type SimNode = Node & { forceX?: number; forceY?: number };
+  const layoutedNodes: SimNode[] = nodes.map((n) => ({
     ...n,
     position: { ...n.position }
   }));
@@ -707,7 +716,7 @@ function KnowledgeGraphFlowCanvas({ onGoToUpload }: { onGoToUpload?: () => void 
   const onNodeClick = useCallback(
     (_: React.MouseEvent, node: Node) => {
       const found = rawNodes.find((n) => n.id === node.id || n.label === node.id);
-      setSelectedNodeData(found || { id: node.id, label: node.id, type: node.data.type || "Requirement", aliases: [] });
+      setSelectedNodeData(found || { id: node.id, label: node.id, type: String(node.data.type ?? "Requirement"), aliases: [] });
       setSelectedEdgeData(null);
 
       const connected = new Set<string>([node.id]);
@@ -747,7 +756,7 @@ function KnowledgeGraphFlowCanvas({ onGoToUpload }: { onGoToUpload?: () => void 
     const matchedNode = rfNodes.find(
       (n) =>
         n.id.toLowerCase().includes(term.toLowerCase()) ||
-        n.data.label.toLowerCase().includes(term.toLowerCase())
+        String(n.data.label ?? "").toLowerCase().includes(term.toLowerCase())
     );
     if (matchedNode) {
       reactFlowInstance.fitView({ nodes: [matchedNode], duration: 600, maxZoom: 1.3 });
@@ -1148,7 +1157,7 @@ function KnowledgeGraphFlowCanvas({ onGoToUpload }: { onGoToUpload?: () => void 
                 <Controls className="!bg-bg-secondary !border-border-default !rounded-xl overflow-hidden" />
                 <MiniMap
                   nodeColor={(node) => {
-                    const type = node.data?.type || "";
+                    const type = String(node.data?.type ?? "");
                     const color = ENTITY_COLORS[type];
                     return color ? color.dot : "#8b5cf6";
                   }}
@@ -1435,10 +1444,11 @@ function KnowledgeGraphFlowCanvas({ onGoToUpload }: { onGoToUpload?: () => void 
                         <button
                           key={idx}
                           onClick={() => {
-                            const targetNode = rfNodes.find(n => 
-                              n.data.label.toLowerCase() === c.document.toLowerCase().replace(".pdf", "").replace(".txt", "") ||
-                              queryResult.debug_info?.matched_entities.some((me: string) => n.data.label.toLowerCase() === me.toLowerCase())
-                            );
+                            const targetNode = rfNodes.find(n => {
+                              const nodeLabel = String(n.data.label ?? "").toLowerCase();
+                              return nodeLabel === c.document.toLowerCase().replace(".pdf", "").replace(".txt", "") ||
+                                queryResult.debug_info?.matched_entities?.some((me: string) => nodeLabel === me.toLowerCase());
+                            });
                             if (targetNode) {
                               reactFlowInstance.fitView({ nodes: [targetNode], duration: 600, maxZoom: 1.3 });
                               const rawN = rawNodes.find(rn => rn.id === targetNode.id);
