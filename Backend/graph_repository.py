@@ -664,7 +664,12 @@ class Neo4jGraphRepository:
         return res_list
 
     def delete_document_graph(self, document_id: Union[str, int]) -> int:
-        """Remove all relationships and orphan nodes associated with a document ID."""
+        """Remove all relationships and now-orphaned nodes for a document ID.
+
+        Deleting only the edges (as this used to) left every extracted entity
+        behind forever, so re-uploading a document grew the node count without
+        bound and deleted documents kept haunting the graph.
+        """
         self._clear_caches()
         if self.use_fallback or not self.driver:
             return self._fallback_delete(document_id)
@@ -677,10 +682,27 @@ class Neo4jGraphRepository:
             DELETE r
             RETURN count(r) as deleted_count
             """
+            # Only nodes from this document that are left with no remaining
+            # edges are removed — an entity still referenced by another
+            # document's relationships must survive.
+            orphan_cypher = """
+            MATCH (n:Entity)
+            WHERE n.document_id = $doc_id AND NOT (n)--()
+            DELETE n
+            RETURN count(n) as orphan_count
+            """
             with self.driver.session() as session:
                 res = session.run(cypher, doc_id=doc_str)
                 rec = res.single()
-                return rec["deleted_count"] if rec else 0
+                deleted = rec["deleted_count"] if rec else 0
+
+                orphan_res = session.run(orphan_cypher, doc_id=doc_str)
+                orphan_rec = orphan_res.single()
+                logger.info(
+                    "[graph_repository] doc %s: deleted %d relationships, %d orphan nodes",
+                    doc_str, deleted, orphan_rec["orphan_count"] if orphan_rec else 0,
+                )
+                return deleted
         except Exception as e:
             logger.warning("[graph_repository] Neo4j delete failed: %s. Switching to SQLite fallback.", e)
             self.use_fallback = True
@@ -692,8 +714,56 @@ class Neo4jGraphRepository:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM relationships WHERE document_id = ?", (doc_str,))
             deleted = cursor.rowcount
+            # Same orphan cleanup as the Neo4j path: drop this document's
+            # entities that no surviving relationship still points at.
+            cursor.execute(
+                """
+                DELETE FROM entities
+                WHERE document_id = ?
+                  AND canonical_name NOT IN (SELECT source FROM relationships)
+                  AND canonical_name NOT IN (SELECT target FROM relationships)
+                """,
+                (doc_str,),
+            )
             conn.commit()
             return deleted
+
+    def purge_all(self) -> Dict[str, int]:
+        """Drop every entity and relationship from the graph store.
+
+        Needed because the graph lives in an external Neo4j instance that
+        survives redeploys, while the document table sits on the app's own
+        (often ephemeral) disk. When those two drift apart the graph shows
+        entities for documents that no longer exist anywhere.
+        """
+        self._clear_caches()
+        if self.use_fallback or not self.driver:
+            with sqlite3.connect(self._fallback_db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM entities")
+                nodes = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM relationships")
+                edges = cursor.fetchone()[0]
+                cursor.execute("DELETE FROM relationships")
+                cursor.execute("DELETE FROM entities")
+                conn.commit()
+            return {"nodes_deleted": nodes, "relationships_deleted": edges}
+
+        try:
+            with self.driver.session() as session:
+                rec = session.run(
+                    "MATCH (n:Entity) "
+                    "OPTIONAL MATCH (n)-[r:COMPLIANCE_REL]->() "
+                    "RETURN count(distinct n) as nodes, count(r) as edges"
+                ).single()
+                nodes = rec["nodes"] if rec else 0
+                edges = rec["edges"] if rec else 0
+                session.run("MATCH (n:Entity) DETACH DELETE n")
+            logger.info("[graph_repository] purged graph: %d nodes, %d relationships", nodes, edges)
+            return {"nodes_deleted": nodes, "relationships_deleted": edges}
+        except Exception as e:
+            logger.error("[graph_repository] Neo4j purge failed: %s", e)
+            raise
 
     def get_stats(self) -> GraphStatsResponse:
         """Get Knowledge Graph aggregate metrics."""

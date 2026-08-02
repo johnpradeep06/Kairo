@@ -163,6 +163,12 @@ class GraphService:
             "graph_size_edges": current_stats.total_relationships
         }
 
+    def purge_graph(self) -> Dict[str, int]:
+        """Drop the entire knowledge graph (see graph_repository.purge_all)."""
+        result = self.repository.purge_all()
+        logger.info("[graph_service] purged knowledge graph: %s", result)
+        return result
+
     def delete_document_graph(self, doc_id: Union[str, int]) -> int:
         """Remove document entity relationships from Neo4j."""
         deleted = self.repository.delete_document_graph(doc_id)

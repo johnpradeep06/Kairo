@@ -77,6 +77,24 @@ def delete_document_graph(doc_id: str) -> Dict[str, Any]:
         )
 
 
+@router.post("/purge")
+def purge_knowledge_graph() -> Dict[str, Any]:
+    """Wipe every entity and relationship from the graph store.
+
+    The graph lives in an external Neo4j instance that outlives the app's own
+    storage, so after a redeploy that resets the document table the graph can
+    still be full of entities belonging to documents that no longer exist.
+    This resets it to empty so the corpus can be re-ingested cleanly.
+    """
+    try:
+        return {"status": "success", **graph_service.purge_graph()}
+    except Exception as err:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to purge knowledge graph: {err}"
+        )
+
+
 @router.post("/ingest")
 def trigger_graph_ingestion(file_path: str, doc_id: Union[str, int]) -> Dict[str, Any]:
     """Manually trigger Knowledge Graph synthesis for an uploaded file."""
