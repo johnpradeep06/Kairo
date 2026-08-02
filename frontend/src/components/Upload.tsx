@@ -170,7 +170,7 @@ export default function UploadComponent({ onUploadSuccess }: UploadProps = {}) {
                     ref={fileInputRef}
                     onChange={handleFileChange}
                     className="hidden"
-                    accept=".pdf,.txt,.doc,.docx"
+                    accept=".pdf,.txt,.doc,.docx,.mp3,.wav,.m4a,.aac,audio/mpeg,audio/wav,audio/aac,audio/mp4,audio/x-m4a"
                     multiple
                 />
 
@@ -178,7 +178,7 @@ export default function UploadComponent({ onUploadSuccess }: UploadProps = {}) {
                     <UploadCloud size={32} className="text-text-secondary" />
                 </div>
                 <p className="text-text-primary font-medium text-lg mb-1">Click to select files or drag & drop multiple files</p>
-                <p className="text-text-secondary text-sm opacity-80 font-medium">PDF, TXT, DOC, DOCX files</p>
+                <p className="text-text-secondary text-sm opacity-80 font-medium">PDF, TXT, DOC, DOCX, MP3, WAV, M4A, AAC files</p>
             </div>
 
             {hasItems && (

@@ -16,6 +16,10 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.embeddings import Embeddings
+import openai
+from langchain_core.documents import Document as LCDocument
+
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac"}
 
 class JinaEmbeddings(Embeddings):
     def __init__(self, api_key: str):
@@ -165,6 +169,28 @@ text_splitter = RecursiveCharacterTextSplitter(
 )
 
 
+def extract_audio(file_path: str) -> str:
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        raise ValueError("GROQ_API_KEY is missing in environment variables.")
+    try:
+        client = openai.OpenAI(
+            api_key=groq_api_key,
+            base_url="https://api.groq.com/openai/v1"
+        )
+        with open(file_path, "rb") as file:
+            transcription = client.audio.transcriptions.create(
+                model="whisper-large-v3",
+                file=file
+            )
+        text = transcription.text
+        if not text or not text.strip():
+            raise ValueError("Audio transcription returned an empty string.")
+        return text
+    except Exception as e:
+        raise RuntimeError(f"Audio transcription failed: {e}")
+
+
 def ingest_document(file_path: str, doc_id: int | None = None) -> int:
     """Load a file, split it, and add it to the vectorstore.
 
@@ -182,6 +208,8 @@ def ingest_document(file_path: str, doc_id: int | None = None) -> int:
 
     ext = os.path.splitext(file_path)[1].lower()
 
+    docs = []
+    loader = None
     if ext == ".pdf":
         loader = PyPDFLoader(file_path)
     elif ext == ".txt":
@@ -189,10 +217,18 @@ def ingest_document(file_path: str, doc_id: int | None = None) -> int:
     elif ext == ".docx":
         from langchain_community.document_loaders import Docx2txtLoader
         loader = Docx2txtLoader(file_path)
+    elif ext in AUDIO_EXTENSIONS:
+        transcript_text = extract_audio(file_path)
+        docs = [LCDocument(page_content=transcript_text, metadata={"source": file_path})]
     else:
         raise ValueError(f"Unsupported file type: {ext}")
 
-    docs = loader.load()
+    if loader:
+        docs = loader.load()
+    
+    if not docs:
+        raise ValueError("No documents or transcript generated.")
+
     splits = text_splitter.split_documents(docs)
 
     filename = os.path.basename(file_path)

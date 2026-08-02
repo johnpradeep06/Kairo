@@ -30,7 +30,7 @@ from auth import (
 )
 from rag_pipeline import (
     rag_answer, ingest_document, delete_document_chunks, serialize_citations,
-    generate_follow_ups, run_agentic_rag_stream, describe_llm_failure,
+    generate_follow_ups, run_agentic_rag_stream, describe_llm_failure, AUDIO_EXTENSIONS
 )
 from multi_agent_pipeline import run_multi_agent_pipeline_stream
 from graph_router import router as graph_router
@@ -73,6 +73,7 @@ async def options_route(full_path: str):
     return Response(status_code=200)
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024
+MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024
 
 # -------------------------
 # Helpers
@@ -367,7 +368,7 @@ def read_users_me(current_user: User = Depends(get_current_user)):
 UPLOAD_DIR = os.getenv("UPLOAD_DIRECTORY", "uploaded_files")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx"}
+ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx"}.union(AUDIO_EXTENSIONS)
 
 
 @app.on_event("startup")
@@ -493,7 +494,7 @@ def upload_file(
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type '{ext}'. Allowed: PDF, TXT, DOCX."
+            detail=f"Unsupported file type '{ext}'. Allowed: PDF, TXT, DOCX, MP3, WAV, M4A, AAC."
         )
 
     file_location = os.path.join(UPLOAD_DIR, filename)
@@ -506,6 +507,12 @@ def upload_file(
         raise HTTPException(
             status_code=413,
             detail=f"File is {size / 1024 / 1024:.1f} MB; the limit is {MAX_UPLOAD_BYTES // 1024 // 1024} MB.",
+        )
+    if ext in AUDIO_EXTENSIONS and size > MAX_AUDIO_UPLOAD_BYTES:
+        os.remove(file_location)
+        raise HTTPException(
+            status_code=413,
+            detail=f"Audio file is {size / 1024 / 1024:.1f} MB. Groq Whisper API maximum supported size is {MAX_AUDIO_UPLOAD_BYTES // 1024 // 1024} MB."
         )
 
     content_hash = sha256_of(file_location)
