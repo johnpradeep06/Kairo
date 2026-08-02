@@ -176,152 +176,16 @@ class GraphService:
         top_k: int = 5,
         depth: int = 2
     ) -> GraphRAGResponse:
-        """Redesigned graph-first retrieval pipeline implementing local entity matching & traversal."""
-        # 1. Local Entity Matching
-        matched_entities = self.repository.local_match_entities(question)
-        seeds = [m["canonical_name"] for m in matched_entities]
-        
-        subgraph = None
-        evidence_context = ""
-        citations = []
-        is_fallback_vector = False
-
-        if seeds:
-            # 2. Graph Traversal (BFS)
-            subgraph = self.repository.get_subgraph_around_seeds(seeds, depth=depth, max_nodes=50)
-            
-            # 3. Vector Retrieval (Chroma chunks for traversed nodes only)
-            if subgraph and subgraph.nodes:
-                from rag_pipeline import retrieve_context_for_graph_nodes
-                evidence_context, citations, _ = retrieve_context_for_graph_nodes(subgraph.nodes)
-        
-        # If no seeds matched or no vector chunks found, fallback to vector search
-        if not evidence_context:
-            from rag_pipeline import retrieve_context
-            evidence_context, citations, _ = retrieve_context(question)
-            is_fallback_vector = True
-            if not subgraph:
-                subgraph = SubGraph()
-
-        # Compile Graph Facts context text
-        context_lines: List[str] = ["=== ENTITIES IN GRAPH ==="]
-        for node in subgraph.nodes:
-            alias_str = f" (aka {', '.join(node.aliases)})" if node.aliases else ""
-            context_lines.append(f"- [{node.type}] {node.label}{alias_str}")
-
-        context_lines.append("\n=== COMPLIANCE RELATIONSHIPS & EVIDENCE ===")
-        for edge in subgraph.edges:
-            context_lines.append(
-                f"- ({edge.source}) --[{edge.relation}]--> ({edge.target}) (Confidence: {edge.confidence:.2f})"
-            )
-        graph_context = "\n".join(context_lines)
-
-        # 4. Hybrid Prompt Construction
-        hybrid_prompt = f"""You are Kairo, a knowledgeable, concise, and professional Enterprise Compliance Copilot.
-Answer the User Question using only the provided compliance facts from the Knowledge Graph and Supporting Document Chunks.
-
-=== USER QUESTION ===
-{question}
-
-=== COMPLIANCE KNOWLEDGE GRAPH FACTS ===
-{graph_context}
-
-=== SUPPORTING DOCUMENT EVIDENCE CHUNKS ===
-{evidence_context}
-
-=== INSTRUCTIONS ===
-1. Only answer using the Graph Facts and Supporting Document Chunks provided above.
-2. Never invent entities, relationships, or facts not mentioned in the contexts.
-3. Never use external knowledge or repository files.
-4. If the required information does not exist in the contexts, explicitly state: "No supporting evidence found in uploaded documents."
-5. Cite the supporting documents using their citation markers, e.g. [1], [2], where appropriate.
-
-Answer:"""
-
-        # 5. Single LLM Call (Inference)
-        import time
-        start_llm_time = time.time()
-        from rag_pipeline import llm
-        try:
-            from langchain_core.prompts import PromptTemplate
-            from langchain_core.output_parsers import StrOutputParser
-            chain = PromptTemplate.from_template("{prompt}") | llm | StrOutputParser()
-            answer = chain.invoke({"prompt": hybrid_prompt})
-        except Exception as err:
-            logger.error("[graph_service] Redesigned Graph RAG LLM call failed: %s", err)
-            answer = "No supporting evidence found in uploaded documents due to service unavailability."
-        llm_latency = round(time.time() - start_llm_time, 2)
-
-        # Compile dynamic confidence score
-        num_nodes = len(subgraph.nodes)
-        num_edges = len(subgraph.edges)
-        seed_coverage = 0.0
-        density_factor = 0.0
-        avg_rel_confidence = 0.0
-        if num_nodes == 0:
-            dyn_confidence = 0.0
-        else:
-            matched_seeds = 0
-            nodes_labels_lower = {n.label.lower() for n in subgraph.nodes}
-            for s in seeds:
-                s_clean = s.lower()
-                if any(s_clean in l or l in s_clean for l in nodes_labels_lower):
-                    matched_seeds += 1
-            seed_coverage = (matched_seeds / len(seeds)) if seeds else 0.0
-            subgraph_density = (num_edges / num_nodes) if num_nodes > 0 else 0.0
-            density_factor = min(subgraph_density / 2.0, 1.0)
-            avg_rel_confidence = sum(e.confidence for e in subgraph.edges) / num_edges if num_edges > 0 else 0.0
-            
-            if num_edges == 0:
-                dyn_confidence = 0.3 * seed_coverage + 0.2
-            else:
-                dyn_confidence = (0.3 * seed_coverage) + (0.3 * density_factor) + (0.4 * avg_rel_confidence)
-            dyn_confidence = max(min(dyn_confidence, 1.0), 0.05)
-
-        # 6. Graph Debug Panel Payload
-        import re
-        norm_query = question.lower().strip()
-        norm_query = re.sub(r'[^\w\s-]', '', norm_query)
-        
-        matched_aliases = []
-        for m in matched_entities:
-            if "matched_by" in m and m["matched_by"].startswith("alias:"):
-                matched_aliases.append(m["matched_by"].replace("alias: ", ""))
-
-        confidence_breakdown = (
-            f"Seed Coverage: {(seed_coverage * 100):.1f}%, "
-            f"Density Factor: {(density_factor * 100):.1f}%, "
-            f"Avg Rel Conf: {(avg_rel_confidence * 100):.1f}%"
-        )
-
-        debug_info = {
-            "normalized_query": norm_query,
-            "matched_aliases": matched_aliases,
-            "canonical_entities": [m["canonical_name"] for m in matched_entities],
-            "seed_nodes": seeds,
-            "traversal_order": seeds + [n.label for n in subgraph.nodes if n.label not in seeds] if subgraph else [],
-            "hop_count": depth,
-            "visited_nodes": [n.label for n in subgraph.nodes] if subgraph else [],
-            "visited_relationships": [f"{e.source} --[{e.relation}]--> {e.target}" for e in subgraph.edges] if subgraph else [],
-            "retrieved_chunk_ids": list(set([n.chunk_id for n in subgraph.nodes if n.chunk_id])) if subgraph else [],
-            "retrieved_documents": list(set([n.document_id for n in subgraph.nodes if n.document_id])) if subgraph else [],
-            "prompt_length": len(hybrid_prompt),
-            "llm_latency": f"{llm_latency:.2f}s",
-            "confidence_breakdown": confidence_breakdown,
-            "number_of_openrouter_calls": 1,
-            "user_query": question,
-            "final_llm_request": hybrid_prompt,
-            "supporting_chunks": [dataclasses.asdict(c) for c in citations]
-        }
-
+        """Invokes the unified enterprise_query_service to run Graph-first query routing."""
+        res = enterprise_query_service.query(question, force_graph=True, depth=depth)
         return GraphRAGResponse(
-            question=question,
-            answer=answer,
-            graph_context=graph_context,
-            seed_entities=seeds,
-            subgraph=self._post_process_subgraph(subgraph),
-            confidence=dyn_confidence,
-            debug_info=debug_info
+            question=res.question,
+            answer=res.answer,
+            graph_context=res.graph_context,
+            seed_entities=res.seed_entities,
+            subgraph=res.subgraph,
+            confidence=res.confidence,
+            debug_info=res.debug_info
         )
 
     def _post_process_subgraph(self, subgraph: SubGraph) -> SubGraph:
@@ -424,3 +288,321 @@ Answer:"""
 
 # Global Singleton Service
 graph_service = GraphService()
+
+
+# =========================================================
+# UNIFIED ENTERPRISE QUERY SERVICE
+# =========================================================
+
+@dataclasses.dataclass
+class EnterpriseQueryResult:
+    question: str
+    answer: str
+    graph_context: str
+    seed_entities: List[str]
+    subgraph: SubGraph
+    citations: List[Any]
+    confidence: float
+    source_type: str
+    debug_info: Dict[str, Any]
+
+    def to_dict(self) -> dict:
+        return {
+            "answer": self.answer,
+            "citations": [dataclasses.asdict(c) for c in self.citations],
+            "confidence": round(self.confidence, 3),
+            "source_type": self.source_type,
+            "debug_info": self.debug_info
+        }
+
+class EnterpriseQueryService:
+    def __init__(self, repository):
+        self.repository = repository
+
+    def query(self, question: str, force_graph: bool = False, history: list = None, depth: int = 2) -> EnterpriseQueryResult:
+        import re
+        import time
+        from graph_models import SubGraph
+        from rag_pipeline import wants_web_search, format_history, exa_search_fallback, clean_answer, _cited_indices
+        
+        # 1. Query normalization
+        norm_query = question.lower().strip()
+        norm_query = re.sub(r'[^\w\s-]', '', norm_query)
+        norm_query = re.sub(r'[\U00010000-\U0010ffff]', '', norm_query) # Strip emojis from query
+
+        # 2. Intent classification
+        intent = "vector"
+        explicit_web = wants_web_search(question)
+        is_latest = any(word in norm_query.split() for word in ["current", "latest", "today", "now", "recent", "newest"])
+        
+        graph_keywords = [
+            "who owns", "which controls", "what risks", "which regulations", 
+            "connected to", "related to", "relationship", "how is", 
+            "depend on", "dependency", "mitigate", "protect", "affect", "apply to"
+        ]
+        has_graph_keyword = any(kw in norm_query for kw in graph_keywords)
+        matched_entities = self.repository.local_match_entities(question)
+        seeds = [m["canonical_name"] for m in matched_entities]
+
+        if explicit_web or is_latest:
+            intent = "web"
+        elif force_graph or has_graph_keyword or len(matched_entities) > 0:
+            intent = "graph"
+        else:
+            vector_keywords = ["summarize", "summary", "explain", "explanation", "what information", "tell me about", "document"]
+            if any(vk in norm_query for vk in vector_keywords):
+                intent = "vector"
+
+        # 3. Context retrieval
+        subgraph = SubGraph()
+        graph_context = ""
+        evidence_context = ""
+        citations = []
+        source_type = "none"
+
+        if intent == "web":
+            try:
+                answer, citations = exa_search_fallback(question)
+                answer = re.sub(r'[\U00010000-\U0010ffff]', '', answer) # Strip emojis from web answer
+                return EnterpriseQueryResult(
+                    question=question,
+                    answer=answer,
+                    graph_context="",
+                    seed_entities=[],
+                    subgraph=subgraph,
+                    citations=citations,
+                    confidence=0.35 if citations else 0.2,
+                    source_type="web",
+                    debug_info={
+                        "normalized_query": norm_query,
+                        "matched_aliases": [],
+                        "canonical_entities": [],
+                        "seed_nodes": [],
+                        "traversal_order": [],
+                        "hop_count": 0,
+                        "visited_nodes": [],
+                        "visited_relationships": [],
+                        "retrieved_chunk_ids": [],
+                        "retrieved_documents": [],
+                        "prompt_length": 0,
+                        "llm_latency": "0.00s",
+                        "confidence_breakdown": "Web search",
+                        "number_of_openrouter_calls": 1
+                    }
+                )
+            except Exception as e:
+                logger.error("Web search fallback failed: %s", e)
+                evidence_context = ""
+
+        elif intent == "graph":
+            if seeds:
+                subgraph = self.repository.get_subgraph_around_seeds(seeds, depth=depth, max_nodes=50)
+                from graph_service import graph_service
+                subgraph = graph_service._post_process_subgraph(subgraph)
+                
+                if subgraph and subgraph.nodes:
+                    from rag_pipeline import retrieve_context_for_graph_nodes
+                    evidence_context, citations, _ = retrieve_context_for_graph_nodes(subgraph.nodes)
+                    source_type = "hybrid"
+
+                    # Compile Graph Facts context text using canonical names for the LLM
+                    context_lines = ["=== ENTITIES IN GRAPH ==="]
+                    for node in subgraph.nodes:
+                        alias_str = f" (aka {', '.join(node.aliases)})" if node.aliases else ""
+                        context_lines.append(f"- [{node.type}] {node.label}{alias_str}")
+                    context_lines.append("\n=== COMPLIANCE RELATIONSHIPS & EVIDENCE ===")
+                    
+                    uuid_to_label = {node.id: node.label for node in subgraph.nodes}
+                    for edge in subgraph.edges:
+                        src_label = uuid_to_label.get(edge.source, edge.source)
+                        tgt_label = uuid_to_label.get(edge.target, edge.target)
+                        context_lines.append(
+                            f"- ({src_label}) --[{edge.relation}]--> ({tgt_label}) (Confidence: {edge.confidence:.2f})"
+                        )
+                    graph_context = "\n".join(context_lines)
+
+        # Fallback to vector search if graph returned no evidence
+        if (intent == "vector" or (intent == "graph" and not evidence_context)) and not evidence_context:
+            from rag_pipeline import retrieve_context
+            evidence_context, citations, highest_score = retrieve_context(question)
+            source_type = "documents"
+
+        # 4. Check if we have any evidence
+        if not evidence_context:
+            return EnterpriseQueryResult(
+                question=question,
+                answer="I could not find sufficient evidence in the uploaded enterprise knowledge base. Would you like me to search external sources?",
+                graph_context="",
+                seed_entities=[],
+                subgraph=SubGraph(),
+                citations=[],
+                confidence=0.0,
+                source_type="none",
+                debug_info={
+                    "normalized_query": norm_query,
+                    "matched_aliases": [],
+                    "canonical_entities": [],
+                    "seed_nodes": [],
+                    "traversal_order": [],
+                    "hop_count": 0,
+                    "visited_nodes": [],
+                    "visited_relationships": [],
+                    "retrieved_chunk_ids": [],
+                    "retrieved_documents": [],
+                    "prompt_length": 0,
+                    "llm_latency": "0.00s",
+                    "confidence_breakdown": "No enterprise evidence found",
+                    "number_of_openrouter_calls": 0
+                }
+            )
+
+        # 5. Merge retrieved evidence and run LLM
+        context_str = ""
+        if graph_context:
+            context_str += f"{graph_context}\n\n"
+        if evidence_context:
+            context_str += f"=== SUPPORTING DOCUMENT EVIDENCE CHUNKS ===\n{evidence_context}"
+
+        hybrid_prompt = f"""You are Kairo, a knowledgeable, concise, and professional Enterprise Compliance Copilot.
+Answer the User Question using only the provided compliance facts from the Knowledge Graph and Supporting Document Chunks.
+
+=== USER QUESTION ===
+{question}
+
+=== COMPLIANCE FACTS & SUPPORTING EVIDENCE ===
+{context_str}
+
+=== INSTRUCTIONS ===
+1. Only answer using the Compliance Facts and Supporting Document Chunks provided above.
+2. Never invent entities, relationships, or facts not mentioned in the contexts.
+3. Never use external knowledge or repository files.
+4. If the required information does not exist in the contexts, explicitly state: "No supporting evidence found in uploaded documents."
+5. Cite the supporting documents using their citation markers, e.g. [1], [2], where appropriate.
+6. Absolutely do NOT use any emojis in your response.
+
+Answer:"""
+
+        start_llm_time = time.time()
+        from rag_pipeline import llm
+        try:
+            from langchain_core.prompts import PromptTemplate
+            from langchain_core.output_parsers import StrOutputParser
+            chain = PromptTemplate.from_template("{prompt}") | llm | StrOutputParser()
+            answer = chain.invoke({"prompt": hybrid_prompt})
+        except Exception as err:
+            logger.error("[enterprise_query_service] LLM call failed: %s", err)
+            answer = "I could not find sufficient evidence in the uploaded enterprise knowledge base. Would you like me to search external sources?"
+        llm_latency = round(time.time() - start_llm_time, 2)
+
+        # 6. Hallucination audit / refuse handling
+        answer = clean_answer(answer)
+        answer = re.sub(r'[\U00010000-\U0010ffff]', '', answer) # Strip emojis
+
+        from rag_pipeline import _FALLBACK_TRIGGERS
+        answer_lower = answer.lower()
+        refused = any(trigger in answer_lower for trigger in _FALLBACK_TRIGGERS) or "no supporting evidence" in answer_lower
+
+        if refused:
+            return EnterpriseQueryResult(
+                question=question,
+                answer="I could not find sufficient evidence in the uploaded enterprise knowledge base. Would you like me to search external sources?",
+                graph_context="",
+                seed_entities=[],
+                subgraph=SubGraph(),
+                citations=[],
+                confidence=0.0,
+                source_type="none",
+                debug_info={
+                    "normalized_query": norm_query,
+                    "matched_aliases": [],
+                    "canonical_entities": [],
+                    "seed_nodes": [],
+                    "traversal_order": [],
+                    "hop_count": 0,
+                    "visited_nodes": [],
+                    "visited_relationships": [],
+                    "retrieved_chunk_ids": [],
+                    "retrieved_documents": [],
+                    "prompt_length": len(hybrid_prompt),
+                    "llm_latency": f"{llm_latency:.2f}s",
+                    "confidence_breakdown": "LLM refused to answer",
+                    "number_of_openrouter_calls": 1
+                }
+            )
+
+        # 7. Citations & confidence
+        used_indices = _cited_indices(answer)
+        final_citations = [c for c in citations if c.index in used_indices]
+
+        # Calculate confidence
+        num_nodes = len(subgraph.nodes) if subgraph else 0
+        num_edges = len(subgraph.edges) if subgraph else 0
+        seed_coverage = 0.0
+        density_factor = 0.0
+        avg_rel_confidence = 0.0
+        if num_nodes > 0:
+            matched_seeds = 0
+            nodes_labels_lower = {n.label.lower() for n in subgraph.nodes}
+            for s in seeds:
+                s_clean = s.lower()
+                if any(s_clean in l or l in s_clean for l in nodes_labels_lower):
+                    matched_seeds += 1
+            seed_coverage = (matched_seeds / len(seeds)) if seeds else 0.0
+            subgraph_density = (num_edges / num_nodes) if num_nodes > 0 else 0.0
+            density_factor = min(subgraph_density / 2.0, 1.0)
+            avg_rel_confidence = sum(e.confidence for e in subgraph.edges) / num_edges if num_edges > 0 else 0.0
+            
+            if num_edges == 0:
+                dyn_confidence = 0.3 * seed_coverage + 0.2
+            else:
+                dyn_confidence = (0.3 * seed_coverage) + (0.3 * density_factor) + (0.4 * avg_rel_confidence)
+            confidence = max(min(dyn_confidence, 1.0), 0.05)
+        else:
+            from rag_pipeline import _confidence_from
+            highest_score = max([c.score for c in final_citations]) if final_citations else 0.0
+            confidence = _confidence_from(highest_score, final_citations)
+
+        matched_aliases = []
+        for m in matched_entities:
+            if "matched_by" in m and m["matched_by"].startswith("alias:"):
+                matched_aliases.append(m["matched_by"].replace("alias: ", ""))
+
+        confidence_breakdown = (
+            f"Seed Coverage: {(seed_coverage * 100):.1f}%, "
+            f"Density Factor: {(density_factor * 100):.1f}%, "
+            f"Avg Rel Conf: {(avg_rel_confidence * 100):.1f}%"
+        )
+
+        debug_info = {
+            "normalized_query": norm_query,
+            "matched_aliases": matched_aliases,
+            "canonical_entities": [m["canonical_name"] for m in matched_entities],
+            "seed_nodes": seeds,
+            "traversal_order": seeds + [n.label for n in subgraph.nodes if n.label not in seeds] if subgraph else [],
+            "hop_count": depth,
+            "visited_nodes": [n.label for n in subgraph.nodes] if subgraph else [],
+            "visited_relationships": [f"{e.source} --[{e.relation}]--> {e.target}" for e in subgraph.edges] if subgraph else [],
+            "retrieved_chunk_ids": list(set([n.chunk_id for n in subgraph.nodes if n.chunk_id])) if subgraph else [],
+            "retrieved_documents": list(set([n.document_id for n in subgraph.nodes if n.document_id])) if subgraph else [],
+            "prompt_length": len(hybrid_prompt),
+            "llm_latency": f"{llm_latency:.2f}s",
+            "confidence_breakdown": confidence_breakdown,
+            "number_of_openrouter_calls": 1,
+            "user_query": question,
+            "final_llm_request": hybrid_prompt,
+            "supporting_chunks": [dataclasses.asdict(c) for c in final_citations]
+        }
+
+        return EnterpriseQueryResult(
+            question=question,
+            answer=answer,
+            graph_context=graph_context,
+            seed_entities=seeds,
+            subgraph=subgraph,
+            citations=final_citations,
+            confidence=confidence,
+            source_type=source_type,
+            debug_info=debug_info
+        )
+
+enterprise_query_service = EnterpriseQueryService(graph_repository)

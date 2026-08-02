@@ -794,11 +794,7 @@ def rag_answer(
     db: Session = None,
     history: list[dict[str, str]] | None = None,
 ) -> RagResult:
-    """Answer a question against the indexed corpus.
-
-    Returns a RagResult carrying the answer plus the citations and confidence
-    the UI needs. Callers that only want text can use `.answer`.
-    """
+    """Answer a question against the indexed corpus using the unified enterprise_query_service."""
     # 1. FAQ check — a curated answer always wins
     if db is not None:
         try:
@@ -807,8 +803,10 @@ def rag_answer(
             matches = [r for r in active_rules if r.keyword.lower() in q_lower]
             if matches:
                 best_match = max(matches, key=lambda r: len(r.keyword))
+                # Remove emojis from FAQ response
+                clean_response = re.sub(r'[\U00010000-\U0010ffff]', '', best_match.response)
                 return RagResult(
-                    answer=best_match.response,
+                    answer=clean_response,
                     citations=[],
                     confidence=1.0,
                     source_type="faq",
@@ -816,109 +814,17 @@ def rag_answer(
         except Exception as e:
             print(f"Error matching FAQ rules: {e}")
 
-    # 2. Resolve follow-ups, then retrieve
-    search_query = rewrite_query(question, history)
-    explicit_web = wants_web_search(question)
+    # Call the unified EnterpriseQueryService
+    from graph_service import enterprise_query_service
+    res = enterprise_query_service.query(question, history=history)
 
-    # An explicit "search the web" is a direct instruction — honour it without
-    # first making the user sit through a document answer they didn't ask for.
-    if explicit_web:
-        try:
-            web_answer, web_citations = exa_search_fallback(search_query)
-            return RagResult(
-                answer=web_answer,
-                citations=web_citations,
-                confidence=0.35 if web_citations else 0.2,
-                source_type="web",
-                retrieval_failed=False,
-            )
-        except Exception as e:
-            print(f"Exa search (explicit request) failed: {e}")
-            return RagResult(
-                answer=(
-                    "I couldn't run a web search just now — the search service is "
-                    "unavailable. Please try again shortly, or ask me to answer from "
-                    "your indexed documents instead."
-                ),
-                citations=[],
-                confidence=0.0,
-                source_type="none",
-                retrieval_failed=True,
-            )
-
-    context, citations, highest_score = retrieve_context(search_query)
-    source_type = "documents"
-
-    # Integrate Knowledge Graph Traversal & Subgraph Context Assembly (Graph RAG)
-    try:
-        from graph_service import graph_service
-        graph_res = graph_service.query_graph_rag(search_query)
-        if graph_res and graph_res.subgraph.nodes:
-            context = f"{context}\n\n=== COMPLIANCE KNOWLEDGE GRAPH FACTS ===\n{graph_res.graph_context}".strip()
-            source_type = "hybrid"
-    except Exception as g_err:
-        print(f"Knowledge Graph retrieval failed in rag_answer: {g_err}")
-
-    chain = prompt | llm | StrOutputParser()
-    answer = clean_answer(chain.invoke({
-        "context": context or "(no documents matched this query)",
-        "question": question,
-        "history": format_history(history),
-    }))
-
-    answer_lower = answer.lower()
-    refused = any(trigger in answer_lower for trigger in _FALLBACK_TRIGGERS)
-
-    source_type = "hybrid" if source_type == "hybrid" else "documents"
-    confidence = _confidence_from(highest_score, citations)
-
-    # 3. Web fallback — clearly labelled, never blended with document answers
-    if refused:
-        citations = []
-        confidence = 0.0
-        source_type = "none"
-
-        # Judge relevance on the rewritten query, not the raw one: a follow-up
-        # like "and what about that?" carries no topic of its own and would
-        # otherwise be dismissed as off-topic, suppressing a valid fallback.
-        if is_support_relevant(search_query):
-            extended_query = f"{search_query} technical support troubleshooting manual"
-            try:
-                web_answer, web_citations = exa_search_fallback(extended_query)
-                answer = web_answer
-                citations = web_citations
-                source_type = "web"
-                confidence = 0.35 if web_citations else 0.2
-            except Exception as e:
-                # Keep the honest refusal rather than presenting an API error
-                # under a "answered from the web" banner.
-                print(f"Exa search fallback failed: {e}")
-                answer = (
-                    "I couldn't find anything about this in your indexed documents, "
-                    "and the web search fallback is currently unavailable. "
-                    "Try rephrasing, or ask an administrator to upload the relevant document."
-                )
-    else:
-        # Keep only the citations the model actually referenced. If it cited
-        # nothing, it didn't draw on the retrieved context at all — under the
-        # new Rule 2 it likely answered from the established conversation (or
-        # is a greeting/identity reply under Rule 1) — so don't attach
-        # document confidence/sources to an answer that isn't grounded in them.
-        used = _cited_indices(answer)
-        citations = [c for c in citations if c.index in used]
-        if not citations:
-            confidence = 0.0
-            source_type = "conversation" if history else "none"
-
-    # 4. Log the gap for the knowledge-gap dashboard. Only a genuine refusal
-    # counts as a gap — a follow-up answered from conversation memory
-    # succeeded, and logging it would make the dashboard misleading.
-    if refused and db is not None:
+    # Log failed retrieval for gap logging if none matched
+    if res.source_type == "none" and db is not None:
         try:
             db.add(FailedRetrieval(
                 query_text=question,
-                highest_score=highest_score,
-                fallback_triggered=(source_type == "web"),
+                highest_score=0.0,
+                fallback_triggered=False,
             ))
             db.commit()
         except Exception as e:
@@ -926,11 +832,11 @@ def rag_answer(
             print(f"Failed to log retrieval analytics: {e}")
 
     return RagResult(
-        answer=answer,
-        citations=citations,
-        confidence=confidence,
-        source_type=source_type,
-        retrieval_failed=refused,
+        answer=res.answer,
+        citations=res.citations,
+        confidence=res.confidence,
+        source_type=res.source_type,
+        retrieval_failed=(res.source_type == "none"),
     )
 
 

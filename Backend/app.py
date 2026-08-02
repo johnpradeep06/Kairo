@@ -256,7 +256,7 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     new_user = User(
         username=user.username,
         hashed_password=hashed_password,
-        role="technician"  # Force technician role regardless of input
+        role=user.role if user.role in {"technician", "manager"} else "technician"
     )
     db.add(new_user)
     db.commit()

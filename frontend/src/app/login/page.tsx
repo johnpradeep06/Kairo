@@ -54,6 +54,16 @@ export default function LoginPage() {
 
     return (
         <div className="flex min-h-screen items-center justify-center bg-bg-primary relative overflow-hidden font-sans text-text-primary">
+            {/* Top Right FAQ Link */}
+            <div className="absolute top-6 right-6 z-20">
+                <a
+                    href="/faq"
+                    className="inline-flex items-center gap-1.5 px-4 py-2 bg-card-background border border-border-default rounded-xl text-sm font-semibold text-text-secondary hover:text-text-primary hover:border-text-primary transition-all outline-none"
+                >
+                    FAQ
+                </a>
+            </div>
+
             {/* Background Accents */}
             <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-accent/20 blur-[120px] rounded-full pointer-events-none"></div>
             <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-blue-600/20 blur-[120px] rounded-full pointer-events-none"></div>
@@ -118,7 +128,14 @@ export default function LoginPage() {
                     </div>
                 </form>
 
-                <div className="text-center mt-10">
+                <div className="flex flex-col items-center gap-4 mt-10">
+                    <a
+                        href="/register?role=manager"
+                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-accent/10 border border-accent/20 rounded-full text-xs font-semibold text-accent hover:bg-accent/20 hover:scale-105 active:scale-95 transition-all outline-none"
+                    >
+                        Set Up Manager Credentials
+                    </a>
+                    
                     <p className="text-sm text-text-secondary">
                         Don&apos;t have an account?{' '}
                         <a href="/register" className="text-text-primary hover:text-text-secondary underline underline-offset-4 decoration-border-default font-semibold transition-all focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none rounded px-0.5 outline-none">
