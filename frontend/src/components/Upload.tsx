@@ -210,9 +210,13 @@ export default function UploadComponent({ onUploadSuccess }: UploadProps = {}) {
                                         </div>
                                     )}
                                     {item.status === 'success' && (
+                                        // The upload endpoint returns 202 Accepted — the file is only
+                                        // queued at this point, not indexed. Claiming "Indexed" here
+                                        // made users think ingestion was finished and wonder why the
+                                        // knowledge graph was still empty.
                                         <span className="flex items-center gap-1 text-green-500 font-bold text-xs">
                                             <CheckCircle size={12} />
-                                            Indexed
+                                            Uploaded
                                         </span>
                                     )}
                                     {item.status === 'error' && (
@@ -240,6 +244,12 @@ export default function UploadComponent({ onUploadSuccess }: UploadProps = {}) {
                                         style={{ width: `${item.progress}%` }}
                                     />
                                 </div>
+                            )}
+
+                            {item.status === 'success' && (
+                                <p className="text-[11px] text-text-secondary font-sans">
+                                    Now indexing in the background — track progress in the document list below.
+                                </p>
                             )}
 
                             {item.status === 'error' && item.error && (

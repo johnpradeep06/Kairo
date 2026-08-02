@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import UploadComponent from "../../components/Upload";
 import KnowledgeGraphView from "../../components/KnowledgeGraphView";
 import { apiJson } from "../../lib/api";
+import { getIngestStage, TOTAL_INGEST_STEPS } from "../../lib/ingestStages";
 import {
     ArrowLeft, LayoutDashboard, Database, Settings, FileText,
     Clock, Ticket, BarChart2, HelpCircle, Activity, ChevronRight,
@@ -16,11 +17,17 @@ type UploadedFile = {
     id: number;
     filename: string;
     size: number;
-    status: "queued" | "processing" | "indexed" | "error";
+    // The backend walks a document through queued -> PARSING -> EXTRACTING ->
+    // GRAPH_BUILDING -> INDEXING -> indexed (or error). Typing this as a loose
+    // string keeps the UI from silently going blank if a new stage is added
+    // backend-side; unknown stages fall through to the generic "Processing"
+    // label rather than rendering nothing.
+    status: string;
     chunk_count: number;
     error_detail: string | null;
     uploaded_at: string;
 };
+
 
 type FeedbackAnalytics = {
     helpful: number;
@@ -534,7 +541,10 @@ export default function AdminPage() {
 
     // Poll for files that are actively being indexed in the background
     useEffect(() => {
-        const hasProcessing = files.some(f => f.status === 'queued' || f.status === 'processing');
+        // Must cover every in-flight stage, not just 'queued'/'processing'.
+        // Matching only those two stopped polling as soon as the backend moved
+        // to PARSING, freezing the UI on stale data for the whole ingest.
+        const hasProcessing = files.some(f => getIngestStage(f.status) !== null);
         if (hasProcessing) {
             const interval = setInterval(() => {
                 fetchFiles();
@@ -657,12 +667,6 @@ export default function AdminPage() {
                                                                         <span>{f.chunk_count} chunks</span>
                                                                     </>
                                                                 )}
-                                                                {(f.status === "queued" || f.status === "processing") && (
-                                                                    <span className="flex items-center gap-1 text-yellow-400 font-medium">
-                                                                        <Loader2 size={10} className="animate-spin" />
-                                                                        {f.status === "queued" ? "Queued" : "Indexing"}
-                                                                    </span>
-                                                                )}
                                                                 {f.status === "error" && (
                                                                     <span
                                                                         className="flex items-center gap-1 text-red-400 font-medium truncate max-w-[220px]"
@@ -673,6 +677,38 @@ export default function AdminPage() {
                                                                     </span>
                                                                 )}
                                                             </div>
+
+                                                            {/* Live ingestion progress. Entity extraction is LLM-bound and
+                                                                can run for minutes, so the current stage and step count are
+                                                                shown explicitly — otherwise a working upload reads as a
+                                                                frozen page. */}
+                                                            {(() => {
+                                                                const stage = getIngestStage(f.status);
+                                                                if (!stage) return null;
+                                                                const pct = Math.round((stage.step / TOTAL_INGEST_STEPS) * 100);
+                                                                return (
+                                                                    <div className="mt-1.5 max-w-[320px]">
+                                                                        <div className="flex items-center justify-between gap-2 mb-1">
+                                                                            <span className="flex items-center gap-1.5 text-[11px] text-yellow-400 font-medium">
+                                                                                <Loader2 size={10} className="animate-spin shrink-0" />
+                                                                                {stage.label}…
+                                                                            </span>
+                                                                            <span className="text-[10px] text-text-secondary font-mono shrink-0">
+                                                                                {stage.step}/{TOTAL_INGEST_STEPS}
+                                                                            </span>
+                                                                        </div>
+                                                                        <div className="h-1 w-full bg-yellow-400/15 rounded-full overflow-hidden">
+                                                                            <div
+                                                                                className="h-full bg-yellow-400 rounded-full transition-all duration-500"
+                                                                                style={{ width: `${pct}%` }}
+                                                                            />
+                                                                        </div>
+                                                                        <p className="text-[10px] text-text-secondary mt-1">
+                                                                            Large documents can take a few minutes — you can keep working.
+                                                                        </p>
+                                                                    </div>
+                                                                );
+                                                            })()}
                                                         </div>
                                                     </div>
                                                     <div className="flex items-center gap-4 text-xs text-text-secondary flex-shrink-0">
