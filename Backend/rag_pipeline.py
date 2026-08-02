@@ -169,6 +169,143 @@ text_splitter = RecursiveCharacterTextSplitter(
 )
 
 
+# =========================================================
+# SEMANTIC CHUNKING
+# =========================================================
+#
+# Naive fixed-size chunking (RecursiveCharacterTextSplitter) cuts text every N
+# characters regardless of meaning, so a single idea is frequently split across
+# two chunks and unrelated ideas get glued into one. That fragments context and
+# hurts retrieval precision — the exact failure mode this system is meant to
+# avoid.
+#
+# `semantic_split_documents` instead groups *sentences* that are semantically
+# close (in embedding space) and starts a new chunk only where the topic
+# actually shifts. It reuses the configured embedding model, batches all
+# sentence embeddings, and — critically — FAILS OPEN: any error, or an
+# environment where embeddings are unavailable, transparently falls back to the
+# proven recursive splitter so ingestion never breaks.
+
+# Sentence boundary: end punctuation followed by whitespace + capital/quote/digit,
+# or a hard newline break. Conservative so we never split mid-number/abbreviation.
+_SENTENCE_BOUNDARY = re.compile(r'(?<=[.!?])\s+(?=[A-Z0-9"\'(\[])|\n{2,}')
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Break a block of text into trimmed, non-empty sentences."""
+    if not text:
+        return []
+    parts = _SENTENCE_BOUNDARY.split(text)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two vectors, pure-Python (no hard numpy dep)."""
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    """Simple linear-interpolation percentile (pct in 0..100)."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    rank = (pct / 100.0) * (len(s) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(s) - 1)
+    frac = rank - lo
+    return s[lo] + (s[hi] - s[lo]) * frac
+
+
+def semantic_split_documents(
+    docs: list[LCDocument],
+    max_chars: int = 1200,
+    min_chars: int = 200,
+    breakpoint_percentile: float = 90.0,
+) -> list[LCDocument]:
+    """Split documents into semantically coherent chunks.
+
+    Strategy: within each source document, embed every sentence, then walk the
+    sentences accumulating them into a chunk. A new chunk begins when the
+    similarity between consecutive sentences drops below the breakpoint
+    threshold (a topic shift) OR the current chunk would exceed `max_chars`.
+    Adjacent tiny fragments are merged so no chunk is smaller than `min_chars`.
+
+    Metadata from the parent document (page, source, etc.) is preserved on every
+    produced chunk. Falls back to the recursive splitter on any failure.
+    """
+    try:
+        out: list[LCDocument] = []
+        for doc in docs:
+            base_meta = dict(doc.metadata or {})
+            sentences = _split_sentences(doc.page_content)
+
+            # Not enough to be worth semantic analysis — keep whole (still may be
+            # size-split below), or fall through to recursive on very long text.
+            if len(sentences) <= 1:
+                out.append(doc)
+                continue
+
+            # Embed all sentences, batched so a large single-Document file
+            # (e.g. a whole .txt/.docx) never becomes one oversized request.
+            embeddings: list = []
+            _BATCH = 128
+            for start in range(0, len(sentences), _BATCH):
+                embeddings.extend(embedding_func.embed_documents(sentences[start:start + _BATCH]))
+            if not embeddings or len(embeddings) != len(sentences):
+                raise ValueError("sentence embedding count mismatch")
+
+            # Distances between consecutive sentences (1 - cosine similarity).
+            distances = [
+                1.0 - _cosine(embeddings[i], embeddings[i + 1])
+                for i in range(len(sentences) - 1)
+            ]
+            threshold = _percentile(distances, breakpoint_percentile)
+
+            chunks: list[str] = []
+            current: list[str] = [sentences[0]]
+            current_len = len(sentences[0])
+            for i in range(1, len(sentences)):
+                sent = sentences[i]
+                dist = distances[i - 1]
+                would_overflow = current_len + len(sent) + 1 > max_chars
+                topic_shift = dist > threshold and current_len >= min_chars
+                if would_overflow or topic_shift:
+                    chunks.append(" ".join(current))
+                    current = [sent]
+                    current_len = len(sent)
+                else:
+                    current.append(sent)
+                    current_len += len(sent) + 1
+            if current:
+                chunks.append(" ".join(current))
+
+            # Merge any sub-minimum trailing fragment into its predecessor.
+            merged: list[str] = []
+            for c in chunks:
+                if merged and len(c) < min_chars:
+                    merged[-1] = merged[-1] + " " + c
+                else:
+                    merged.append(c)
+
+            for i, text in enumerate(merged):
+                meta = dict(base_meta)
+                meta["semantic_chunk"] = True
+                out.append(LCDocument(page_content=text, metadata=meta))
+
+        # If we somehow produced nothing, fall back.
+        return out or text_splitter.split_documents(docs)
+    except Exception as e:  # noqa: BLE001 — fail open, never block ingestion
+        print(f"[semantic-chunk] falling back to recursive splitter: {e}")
+        return text_splitter.split_documents(docs)
+
+
 def extract_audio(file_path: str) -> str:
     groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
@@ -201,6 +338,10 @@ def ingest_document(file_path: str, doc_id: int | None = None) -> int:
     """
     from settings_manager import load_settings
     settings = load_settings()
+    # Chunking strategy is configurable. "semantic" (default) groups related
+    # sentences and splits on genuine topic shifts; "recursive" is the legacy
+    # fixed-size splitter. Semantic always falls back to recursive on error.
+    chunking_strategy = settings.get("chunking_strategy", "semantic")
     local_text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.get("chunk_size", 1000),
         chunk_overlap=settings.get("chunk_overlap", 200),
@@ -229,7 +370,14 @@ def ingest_document(file_path: str, doc_id: int | None = None) -> int:
     if not docs:
         raise ValueError("No documents or transcript generated.")
 
-    splits = text_splitter.split_documents(docs)
+    if chunking_strategy == "semantic":
+        splits = semantic_split_documents(
+            docs,
+            max_chars=settings.get("chunk_size", 1000) + 200,
+            min_chars=max(150, settings.get("chunk_overlap", 200)),
+        )
+    else:
+        splits = local_text_splitter.split_documents(docs)
 
     filename = os.path.basename(file_path)
     for i, chunk in enumerate(splits):
@@ -738,6 +886,171 @@ def clean_answer(text: str) -> str:
 
 def _cited_indices(answer: str) -> set[int]:
     return {int(n) for n in re.findall(r'\[(\d{1,2})\]', answer)}
+
+
+# =========================================================
+# GROUNDING VERIFICATION (anti-hallucination gate)
+# =========================================================
+#
+# The system prompt already instructs the model to answer only from context,
+# but instructions are soft — models still occasionally assert facts that are
+# not in the retrieved sources. This gate is a HARD, deterministic check that
+# runs after generation: every factual sentence in the answer is measured
+# against the retrieved context by content-word overlap. Sentences with no
+# support are treated as hallucinations and removed; weakly-supported sentences
+# are reported. It uses no extra LLM call (fast, cheap, testable) and is
+# FAIL-OPEN: any error leaves the original answer untouched.
+
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "then", "so", "of", "to", "in",
+    "on", "at", "for", "with", "as", "by", "from", "is", "are", "was", "were",
+    "be", "been", "being", "it", "its", "this", "that", "these", "those", "you",
+    "your", "we", "our", "they", "their", "he", "she", "his", "her", "i", "me",
+    "my", "will", "would", "should", "can", "could", "may", "might", "must",
+    "do", "does", "did", "have", "has", "had", "not", "no", "yes", "there",
+    "here", "which", "who", "whom", "what", "when", "where", "why", "how", "all",
+    "any", "some", "each", "more", "most", "other", "such", "than", "too", "very",
+    "just", "also", "about", "into", "over", "under", "up", "down", "out", "off",
+    "please", "using", "use", "used", "based", "given", "context", "following",
+}
+
+# Sentences that are conversational, meta, or refusals are not factual claims
+# and must never be stripped by the grounding gate.
+_NON_FACTUAL_HINTS = (
+    "sorry", "i don't know", "i do not know", "hello", "hi ", "hey", "sure",
+    "certainly", "of course", "happy to help", "how can i help", "let me know",
+    "would you like", "here are", "here is", "below", "as follows", "i'm kairo",
+    "i am kairo",
+)
+
+
+def _content_words(text: str) -> set[str]:
+    """Lowercased content words (>=3 chars, non-stopword) for overlap scoring."""
+    return {
+        w for w in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9\-']{2,}", text.lower())
+        if w not in _STOPWORDS
+    }
+
+
+def _split_answer_sentences(answer: str) -> list[str]:
+    """Split an answer into sentence-ish units, keeping bullet lines intact."""
+    units: list[str] = []
+    for line in answer.split("\n"):
+        line = line.rstrip()
+        if not line.strip():
+            units.append("")  # preserve blank lines / paragraph breaks
+            continue
+        stripped = line.lstrip()
+        # Keep list items and headings as single units.
+        if stripped.startswith(("-", "*", "#", ">", "|")) or re.match(r"^\d+[.)]\s", stripped):
+            units.append(line)
+            continue
+        for s in re.split(r'(?<=[.!?])\s+(?=[A-Z0-9"\'(\[])', line):
+            if s.strip():
+                units.append(s)
+    return units
+
+
+def assess_grounding(answer: str, context: str, strip: bool = True) -> tuple[str, dict[str, Any]]:
+    """Verify an answer against its context and remove hallucinated sentences.
+
+    Returns (possibly_filtered_answer, report). `report` contains a per-sentence
+    breakdown and an overall grounding score in [0,1]. A sentence counts as
+    supported if it carries a citation marker, is non-factual (greeting/meta),
+    or shares enough content words with the context. Sentences with effectively
+    zero overlap and no citation are dropped when `strip` is True.
+    """
+    try:
+        if not answer or not answer.strip():
+            return answer, {"grounding_score": 0.0, "sentences": [], "removed": []}
+
+        # A refusal is fully grounded by definition — do not touch it.
+        if any(t in answer.lower() for t in _FALLBACK_TRIGGERS):
+            return answer, {"grounding_score": 1.0, "sentences": [], "removed": [], "refusal": True}
+
+        ctx_words = _content_words(context or "")
+        # No context to check against (e.g. conversation-only answer): fail open.
+        if not ctx_words:
+            return answer, {"grounding_score": 1.0, "sentences": [], "removed": [], "no_context": True}
+
+        units = _split_answer_sentences(answer)
+        kept: list[str] = []
+        report_sentences: list[dict[str, Any]] = []
+        removed: list[str] = []
+        supported_count = 0
+        factual_count = 0
+
+        for unit in units:
+            if unit == "" or not unit.strip():
+                kept.append(unit)
+                continue
+
+            has_citation = bool(re.search(r'\[\d{1,2}\]', unit))
+            low = unit.lower()
+            is_non_factual = any(h in low for h in _NON_FACTUAL_HINTS)
+
+            sent_words = _content_words(unit)
+            if not sent_words:
+                # No content words (e.g. a heading like "Steps:") — keep, not a claim.
+                kept.append(unit)
+                continue
+
+            overlap = len(sent_words & ctx_words) / len(sent_words)
+
+            if is_non_factual:
+                status = "meta"
+                kept.append(unit)
+            elif has_citation and overlap >= 0.15:
+                status = "supported"
+                factual_count += 1
+                supported_count += 1
+                kept.append(unit)
+            elif overlap >= 0.5:
+                status = "supported"
+                factual_count += 1
+                supported_count += 1
+                kept.append(unit)
+            elif overlap >= 0.25:
+                status = "partial"
+                factual_count += 1
+                supported_count += 0.5
+                kept.append(unit)
+            else:
+                # Effectively ungrounded factual claim => treat as hallucination.
+                status = "unsupported"
+                factual_count += 1
+                if strip:
+                    removed.append(unit)
+                else:
+                    kept.append(unit)
+
+            report_sentences.append({
+                "sentence": unit.strip()[:300],
+                "status": status,
+                "overlap": round(overlap, 3),
+                "cited": has_citation,
+            })
+
+        grounding_score = round(supported_count / factual_count, 3) if factual_count else 1.0
+
+        # Collapse any blank-line runs the removals may have created.
+        filtered = "\n".join(kept)
+        filtered = re.sub(r'\n{3,}', '\n\n', filtered).strip()
+
+        # Safety: if stripping removed everything meaningful, keep the original
+        # answer rather than returning an empty string.
+        if not filtered.strip():
+            filtered = answer
+
+        report = {
+            "grounding_score": grounding_score,
+            "sentences": report_sentences,
+            "removed": removed,
+        }
+        return filtered, report
+    except Exception as e:  # noqa: BLE001 — never let the gate break a response
+        print(f"[grounding] assessment failed, passing answer through: {e}")
+        return answer, {"grounding_score": 1.0, "sentences": [], "removed": [], "error": str(e)}
 
 
 # An explicit instruction to go to the web. These are commands, not questions —
@@ -1266,6 +1579,11 @@ def run_agentic_rag_stream(
 
     raw_answer = "".join(full_answer_chunks)
     cleaned_ans = clean_answer(raw_answer)
+
+    # Grounding gate: strip any sentence that is not supported by the retrieved
+    # context before it reaches the user. Fail-open (see assess_grounding).
+    cleaned_ans, grounding_report = assess_grounding(cleaned_ans, context, strip=True)
+
     used = _cited_indices(cleaned_ans)
     citations = [c for c in citations if c.index in used]
 
@@ -1278,9 +1596,20 @@ def run_agentic_rag_stream(
         confidence = 0.0
     elif citations:
         source_type = "documents"
+        # Temper confidence by how well the answer is grounded in its sources.
+        confidence = round(confidence * (0.5 + 0.5 * grounding_report.get("grounding_score", 1.0)), 3)
     else:
         source_type = "conversation" if history else "none"
         confidence = 0.0
+
+    if grounding_report.get("removed"):
+        yield {
+            "type": "reflection",
+            "content": (
+                f"Grounding gate removed {len(grounding_report['removed'])} unsupported "
+                f"statement(s). Answer grounding score: {grounding_report.get('grounding_score', 1.0)}."
+            ),
+        }
 
     yield {
         "type": "final",
@@ -1288,4 +1617,5 @@ def run_agentic_rag_stream(
         "citations": [asdict(c) for c in citations],
         "confidence": confidence,
         "source_type": source_type,
+        "grounding": grounding_report,
     }

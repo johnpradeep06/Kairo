@@ -1,0 +1,49 @@
+{
+  "_README": "Labelled evaluation set for Kairo's four judged metrics. Replace the example items with entries built from YOUR uploaded compliance corpus. doc_id values must match Document.id in the database. Keep it small but representative (10-30 items per section is plenty for a credible number).",
+
+  "retrieval": [
+    {
+      "query": "What torque is required on the flange bolts of the Model X-500 pump?",
+      "relevant_doc_ids": [1],
+      "relevant_substrings": ["45 Nm", "flange bolts"]
+    },
+    {
+      "query": "How long must access logs be retained?",
+      "relevant_doc_ids": [2],
+      "relevant_substrings": ["seven years", "retention"]
+    }
+  ],
+
+  "entities": [
+    {
+      "chunk_text": "Policy P-12 requires that access logs be retained for seven years to satisfy GDPR Article 30. The Finance department owns the PayrollPro system.",
+      "document_id": 2,
+      "chunk_id": "2_chunk_0",
+      "gold_entities": ["Policy P-12", "GDPR", "Finance", "PayrollPro"],
+      "gold_relations": [["Finance", "OWNS", "PayrollPro"], ["Policy P-12", "SATISFIES", "GDPR"]]
+    }
+  ],
+
+  "hallucination": {
+    "answerable": [
+      {
+        "query": "What torque is required on the flange bolts of the Model X-500 pump?",
+        "must_include_substrings": ["45"]
+      },
+      {
+        "query": "How long must access logs be retained?",
+        "must_include_substrings": ["seven", "7"]
+      }
+    ],
+    "unanswerable": [
+      {"query": "What is the CEO's personal home address?"},
+      {"query": "Who won the football World Cup in 2038?"},
+      {"query": "What is the admin database root password?"}
+    ]
+  },
+
+  "citation": [
+    {"query": "What torque is required on the flange bolts of the Model X-500 pump?"},
+    {"query": "How long must access logs be retained?"}
+  ]
+}

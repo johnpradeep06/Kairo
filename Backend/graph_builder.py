@@ -275,7 +275,13 @@ def extract_from_chunk(
         source_text=chunk_text[:500]  # Store snippet for context
     )
 
-    chain = EXTRACTION_PROMPT | llm | StrOutputParser()
+    # ponytail: gpt-oss-20b is a reasoning model that spends completion
+    # tokens on hidden chain-of-thought before writing the JSON answer.
+    # The shared chat LLM's max_tokens (tuned for concise RAG answers) gets
+    # exhausted by reasoning alone (observed: 997/1000 tokens on a 945-char
+    # chunk, finish_reason="length", empty content) - extraction needs its
+    # own larger budget, independent of chat-answer token cost tuning.
+    chain = EXTRACTION_PROMPT | llm.bind(max_tokens=8000) | StrOutputParser()
 
     try:
         raw_output = chain.invoke({"chunk_text": chunk_text})
@@ -305,6 +311,7 @@ def extract_from_chunk(
 
     extracted_entities: List[Entity] = []
     name_to_canonical: Dict[str, str] = {}
+    rejected_names: set = set()  # entity names dropped by the grounding gate
 
     valid_entity_types = {e.value for e in EntityType}
     valid_rel_types = {r.value for r in RelationshipType}
@@ -337,6 +344,19 @@ def extract_from_chunk(
 
         etype = EntityType(etype_str)
 
+        # ANTI-HALLUCINATION GATE: only admit entities that actually appear in
+        # the source chunk. The LLM sometimes invents plausible-sounding
+        # entities that are not in the text; without this check they enter the
+        # knowledge graph as fabricated nodes and spawn fabricated edges. Names
+        # rejected here are recorded so any relationship referencing them is
+        # dropped too (see relationship loop below).
+        if not is_entity_grounded_in_chunk(name, chunk_text, etype):
+            logger.info("[graph_builder] Dropped ungrounded entity '%s' (not found in chunk %s)", name, chunk_id)
+            rejected_names.add(name)
+            for alias in cleaned_aliases:
+                rejected_names.add(alias)
+            continue
+
         resolved_entity = resolver.resolve_entity(
             candidate_name=name,
             entity_type=etype,
@@ -365,9 +385,38 @@ def extract_from_chunk(
         if not src or not tgt or not rel_str:
             continue
 
-        # Map to canonical names if resolved
-        src_canonical = name_to_canonical.get(src, src)
-        tgt_canonical = name_to_canonical.get(tgt, tgt)
+        # ANTI-HALLUCINATION GATE (edges): drop any relationship whose endpoint
+        # was rejected as ungrounded, or whose endpoint neither resolved to a
+        # known entity nor appears in the source chunk. This prevents fabricated
+        # or dangling edges from entering the graph.
+        if src in rejected_names or tgt in rejected_names:
+            logger.info("[graph_builder] Dropped relationship '%s --%s--> %s' (endpoint ungrounded) in chunk %s", src, rel_str, tgt, chunk_id)
+            continue
+
+        def _ground_and_resolve(raw_name: str) -> Optional[str]:
+            """Map a relationship endpoint to a canonical entity name, resolving
+            it into a real (tracked) entity if it was grounded in the chunk but
+            missed by the entity-extraction step. Without this, such endpoints
+            fell through as raw strings and downstream persistence minted
+            untyped orphan "Requirement" placeholder nodes for them."""
+            if raw_name in name_to_canonical:
+                return name_to_canonical[raw_name]
+            if not is_entity_grounded_in_chunk(str(raw_name), chunk_text, EntityType.REQUIREMENT):
+                return None
+            entity = resolver.resolve_entity(
+                candidate_name=str(raw_name).strip(),
+                entity_type=EntityType.REQUIREMENT,
+                provenance=provenance
+            )
+            extracted_entities.append(entity)
+            name_to_canonical[raw_name] = entity.canonical_name
+            return entity.canonical_name
+
+        src_canonical = _ground_and_resolve(src)
+        tgt_canonical = _ground_and_resolve(tgt)
+        if not src_canonical or not tgt_canonical:
+            logger.info("[graph_builder] Dropped relationship '%s --%s--> %s' (endpoint not in chunk) in chunk %s", src, rel_str, tgt, chunk_id)
+            continue
 
         if rel_str not in valid_rel_types:
             rel_str = "RELATED_TO"

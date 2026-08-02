@@ -6,6 +6,7 @@ SETTINGS_FILE = os.getenv("SETTINGS_PATH", os.path.join(os.path.dirname(__file__
 DEFAULT_SETTINGS = {
     "chunk_size": 1000,
     "chunk_overlap": 200,
+    "chunking_strategy": "semantic",  # "semantic" (default) or "recursive"
     "temperature": 0.7,
     "top_k": 4,
     "similarity_threshold": 0.15,

@@ -147,6 +147,9 @@ class GraphRAGResponse(BaseModel):
     subgraph: SubGraph
     confidence: float
     debug_info: Optional[Dict[str, Any]] = None
+    # Evidence the answer was grounded in when the query took the vector path
+    # rather than graph traversal (graph_context is empty in that case).
+    evidence_context: str = ""
 
 
 class GraphStatsResponse(BaseModel):

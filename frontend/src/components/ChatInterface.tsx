@@ -407,6 +407,44 @@ export default function ChatInterface({ role, handleLogout }: ChatInterfaceProps
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState("");
     const [isLoading, setIsLoading] = useState(false);
+
+    // Lyzr Studio independent verification, tracked per message so several
+    // answers in a thread can each carry their own audit result.
+    type LyzrState = {
+        loading?: boolean;
+        error?: string;
+        verdict?: "SUPPORTED" | "PARTIALLY_SUPPORTED" | "UNSUPPORTED" | "UNPARSED";
+        hallucination_risk?: number | null;
+        unsupported_claims?: string[];
+        reasoning?: string;
+        agent_id?: string;
+    };
+    const [lyzrConfigured, setLyzrConfigured] = useState(false);
+    const [lyzrByMsg, setLyzrByMsg] = useState<Record<string, LyzrState>>({});
+
+    useEffect(() => {
+        apiJson<{ configured: boolean }>("/lyzr/status")
+            .then((s) => setLyzrConfigured(!!s.configured))
+            .catch(() => setLyzrConfigured(false));
+    }, []);
+
+    const verifyWithLyzr = async (key: string, answer: string, citations: Citation[]) => {
+        setLyzrByMsg((p) => ({ ...p, [key]: { loading: true } }));
+        try {
+            // The chat has no graph traversal, so the retrieved citation
+            // snippets ARE the evidence the answer must be grounded in.
+            const evidence = citations
+                .map((c) => `[${c.index}] ${c.document}${c.page ? ` (p.${c.page})` : ""}: ${c.snippet}`)
+                .join("\n\n");
+            const res = await apiJson<LyzrState>("/lyzr/verify", {
+                method: "POST",
+                body: JSON.stringify({ question: "", answer, graph_context: evidence }),
+            });
+            setLyzrByMsg((p) => ({ ...p, [key]: { ...res, loading: false } }));
+        } catch (err: any) {
+            setLyzrByMsg((p) => ({ ...p, [key]: { loading: false, error: err?.message || "Verification failed" } }));
+        }
+    };
     const [sidebarOpen, setSidebarOpen] = useState(true);
     const [sessions, setSessions] = useState<ChatSession[]>([]);
     const [currentSessionId, setCurrentSessionId] = useState<number | null>(null);
@@ -953,9 +991,58 @@ export default function ChatInterface({ role, handleLogout }: ChatInterfaceProps
                                     · {citations.length}
                                 </span>
                             </div>
-                            {typeof confidence === "number" && sourceType === "documents" && (
-                                <ConfidenceBadge value={confidence} />
-                            )}
+                            <div className="flex items-center gap-1.5">
+                                {(() => {
+                                    const key = String(msg.id ?? mainContent.slice(0, 40));
+                                    const ly = lyzrByMsg[key];
+                                    if (ly?.verdict) {
+                                        const cls =
+                                            ly.verdict === "SUPPORTED"
+                                                ? "bg-good-soft text-good border-good/30"
+                                                : ly.verdict === "UNSUPPORTED"
+                                                ? "bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/30"
+                                                : "bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border-indigo-500/30";
+                                        return (
+                                            <span
+                                                className={`text-[10px] px-2 py-0.5 rounded-md border font-semibold flex items-center gap-1 ${cls}`}
+                                                title={`Lyzr Studio audit — ${ly.verdict.replace(/_/g, " ")}${
+                                                    ly.hallucination_risk != null ? `, hallucination risk ${ly.hallucination_risk}%` : ""
+                                                }${ly.reasoning ? `\n\n${ly.reasoning}` : ""}${
+                                                    ly.unsupported_claims?.length
+                                                        ? `\n\nUnsupported: ${ly.unsupported_claims.join("; ")}`
+                                                        : ""
+                                                }`}
+                                            >
+                                                <ShieldCheck size={10} />
+                                                Lyzr Verified
+                                                {ly.hallucination_risk != null && ` · ${ly.hallucination_risk}%`}
+                                            </span>
+                                        );
+                                    }
+                                    if (ly?.error) {
+                                        return (
+                                            <span className="text-[10px] px-2 py-0.5 rounded-md border border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400" title={ly.error}>
+                                                Lyzr failed
+                                            </span>
+                                        );
+                                    }
+                                    if (!lyzrConfigured || msg.isStreaming) return null;
+                                    return (
+                                        <button
+                                            onClick={() => verifyWithLyzr(key, mainContent, citations)}
+                                            disabled={ly?.loading}
+                                            className="text-[10px] px-2 py-0.5 rounded-md border border-indigo-500/30 bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 font-semibold flex items-center gap-1 hover:bg-indigo-500/20 transition-colors cursor-pointer disabled:opacity-50"
+                                            title="Independently audit this answer against its sources using Lyzr Studio"
+                                        >
+                                            {ly?.loading ? <Loader2 size={10} className="animate-spin" /> : <ShieldCheck size={10} />}
+                                            {ly?.loading ? "Verifying…" : "Verify with Lyzr"}
+                                        </button>
+                                    );
+                                })()}
+                                {typeof confidence === "number" && sourceType === "documents" && (
+                                    <ConfidenceBadge value={confidence} />
+                                )}
+                            </div>
                         </div>
 
                         {sourceType === "web" ? (

@@ -118,7 +118,12 @@ class GraphService:
                 logger.error("[graph_service] Chunk %d extraction failed for doc %s: %s", idx + 1, doc_id, chunk_err, exc_info=True)
                 return idx, None
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # ponytail: free-tier OpenRouter models throttle/empty-reply under
+        # concurrent load (observed 4/5 chunks silently failing at workers=5,
+        # forcing the low-quality heuristic fallback and graph clutter).
+        # Tune via env for paid/higher-limit models.
+        graph_workers = int(os.getenv("GRAPH_EXTRACTION_WORKERS", "2"))
+        with ThreadPoolExecutor(max_workers=graph_workers) as executor:
             futures = [executor.submit(_process_chunk_worker, (i, ch)) for i, ch in enumerate(splits[:max_chunks])]
             for future in as_completed(futures):
                 idx, extraction = future.result()
@@ -185,7 +190,8 @@ class GraphService:
             seed_entities=res.seed_entities,
             subgraph=res.subgraph,
             confidence=res.confidence,
-            debug_info=res.debug_info
+            debug_info=res.debug_info,
+            evidence_context=res.evidence_context,
         )
 
     def _post_process_subgraph(self, subgraph: SubGraph) -> SubGraph:
@@ -305,6 +311,10 @@ class EnterpriseQueryResult:
     confidence: float
     source_type: str
     debug_info: Dict[str, Any]
+    # Raw retrieved text the answer was actually grounded in. Distinct from
+    # graph_context, which is only populated on the graph-traversal path — a
+    # vector-path answer has real evidence but an empty graph_context.
+    evidence_context: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -498,7 +508,11 @@ Answer:"""
         answer = clean_answer(answer)
         answer = re.sub(r'[\U00010000-\U0010ffff]', '', answer) # Strip emojis
 
-        from rag_pipeline import _FALLBACK_TRIGGERS
+        # Grounding gate: strip statements not supported by the graph facts or
+        # supporting evidence chunks before returning. Fail-open.
+        from rag_pipeline import _FALLBACK_TRIGGERS, assess_grounding
+        answer, graph_grounding_report = assess_grounding(answer, context_str, strip=True)
+
         answer_lower = answer.lower()
         refused = any(trigger in answer_lower for trigger in _FALLBACK_TRIGGERS) or "no supporting evidence" in answer_lower
 
@@ -533,6 +547,14 @@ Answer:"""
         # 7. Citations & confidence
         used_indices = _cited_indices(answer)
         final_citations = [c for c in citations if c.index in used_indices]
+
+        # The model does not reliably emit [n] markers even when it answered
+        # purely from the retrieved context. Discarding the citations in that
+        # case zeroed the confidence score AND left the verifier with no
+        # evidence, so a correct, fully grounded answer scored 0% and audited
+        # as 100% hallucinated. Fall back to the retrieved set instead.
+        if not final_citations and citations:
+            final_citations = list(citations)
 
         # Calculate confidence
         num_nodes = len(subgraph.nodes) if subgraph else 0
@@ -590,7 +612,8 @@ Answer:"""
             "number_of_openrouter_calls": 1,
             "user_query": question,
             "final_llm_request": hybrid_prompt,
-            "supporting_chunks": [dataclasses.asdict(c) for c in final_citations]
+            "supporting_chunks": [dataclasses.asdict(c) for c in final_citations],
+            "grounding": graph_grounding_report,
         }
 
         return EnterpriseQueryResult(
@@ -602,7 +625,8 @@ Answer:"""
             citations=final_citations,
             confidence=confidence,
             source_type=source_type,
-            debug_info=debug_info
+            debug_info=debug_info,
+            evidence_context=evidence_context or "",
         )
 
 enterprise_query_service = EnterpriseQueryService(graph_repository)

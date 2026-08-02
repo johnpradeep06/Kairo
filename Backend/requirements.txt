@@ -20,3 +20,4 @@ docx2txt
 langchain-google-genai
 neo4j
 openai
+json_repair

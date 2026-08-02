@@ -62,6 +62,10 @@ type GraphNodeData = {
   aliases: string[];
   document_count?: number;
   provenanceCount?: number;
+  document_id?: string | number;
+  page_number?: number;
+  chunk_id?: string | number;
+  source_text?: string;
   provenance?: Array<{
     document_id: string | number;
     page_number?: number;
@@ -69,6 +73,15 @@ type GraphNodeData = {
     source_text: string;
     confidence?: number;
   }>;
+};
+
+type LyzrVerdict = {
+  verdict: "SUPPORTED" | "PARTIALLY_SUPPORTED" | "UNSUPPORTED" | "UNPARSED";
+  hallucination_risk: number | null;
+  unsupported_claims: string[];
+  reasoning: string;
+  parsed: boolean;
+  agent_id?: string;
 };
 
 type GraphEdgeData = {
@@ -92,6 +105,7 @@ type GraphRAGResponse = {
   question: string;
   answer: string;
   graph_context: string;
+  evidence_context?: string;
   seed_entities: string[];
   subgraph: {
     nodes: GraphNodeData[];
@@ -150,6 +164,7 @@ const CustomBloomNode = ({ data, selected }: { data: any; selected: boolean }) =
   const connections = data.degree || 1;
   const isHighlighted = data.isHighlighted;
   const isFaded = data.isFaded;
+  const [hovered, setHovered] = useState(false);
 
   const color = ENTITY_COLORS[type] || DEFAULT_COLOR;
 
@@ -160,14 +175,68 @@ const CustomBloomNode = ({ data, selected }: { data: any; selected: boolean }) =
   return (
     <div
       style={{ width: `${width}px` }}
-      className={`px-5 py-4 border-2 transition-all duration-300 backdrop-blur-md rounded-2xl shadow-xl flex flex-col items-center justify-center bg-gradient-to-br ${color.bg} ${
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      className={`relative px-5 py-4 border-2 transition-all duration-300 backdrop-blur-md rounded-2xl shadow-xl flex flex-col items-center justify-center bg-gradient-to-br ${color.bg} ${
         selected
           ? "ring-4 ring-amber-400 border-white scale-105 shadow-amber-500/50 z-30"
           : isHighlighted
           ? "border-purple-400 ring-4 ring-purple-500/30 scale-105 z-20 shadow-purple-500/30"
           : "hover:scale-102 hover:border-white"
-      } ${isFaded ? "opacity-20 grayscale" : "opacity-100"}`}
+      } ${hovered ? "z-40" : ""} ${isFaded ? "opacity-20 grayscale" : "opacity-100"}`}
     >
+      {/* HOVER EVIDENCE CARD — surfaces provenance without needing a click,
+          so an entity can be traced back to its raw source text inline. */}
+      {hovered && !isFaded && (
+        <div className="absolute left-1/2 -translate-x-1/2 bottom-[calc(100%+12px)] w-[320px] z-50 pointer-events-none animate-in fade-in duration-150">
+          <div className="bg-[#0b0e14] border-2 rounded-xl shadow-2xl overflow-hidden" style={{ borderColor: color.border }}>
+            <div className="px-3 py-2 flex items-center justify-between border-b border-white/10" style={{ backgroundColor: `${color.border}22` }}>
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: color.dot }} />
+                <span className="text-[10px] uppercase tracking-wider font-mono font-bold text-white/95 truncate">{type}</span>
+              </div>
+              <span className="text-[9px] font-mono font-bold text-white/70 shrink-0">{connections} link{connections === 1 ? "" : "s"}</span>
+            </div>
+
+            <div className="px-3 py-2.5 space-y-2">
+              <p className="text-[13px] font-bold text-white leading-snug break-words">{label}</p>
+
+              {data.aliases && data.aliases.length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                  {data.aliases.slice(0, 4).map((a: string, i: number) => (
+                    <span key={i} className="text-[9px] px-1.5 py-0.5 rounded bg-white/10 text-white/70 font-mono">{a}</span>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[9px] font-mono text-white/60 pt-0.5">
+                {data.documentId != null && <span>doc #{String(data.documentId)}</span>}
+                {data.pageNumber != null && <span>page {String(data.pageNumber)}</span>}
+                {data.chunkId != null && <span className="truncate max-w-[130px]">{String(data.chunkId)}</span>}
+              </div>
+
+              {data.sourceText && (
+                <div className="pt-1.5 border-t border-white/10">
+                  <p className="text-[8px] uppercase tracking-wider font-bold text-white/45 mb-1">Source evidence</p>
+                  <p className="text-[10px] text-white/75 leading-relaxed line-clamp-4 whitespace-pre-wrap break-words">
+                    {data.sourceText.slice(0, 260)}
+                    {data.sourceText.length > 260 ? "…" : ""}
+                  </p>
+                </div>
+              )}
+
+              <p className="text-[9px] text-white/40 pt-1 border-t border-white/10">
+                Click to inspect &middot; Double-click to expand neighbors
+              </p>
+            </div>
+          </div>
+          {/* caret */}
+          <div
+            className="w-2.5 h-2.5 rotate-45 mx-auto -mt-[6px] border-r-2 border-b-2"
+            style={{ backgroundColor: "#0b0e14", borderColor: color.border }}
+          />
+        </div>
+      )}
       <Handle type="target" position={Position.Top} className="!bg-slate-400 !w-3 !h-3" />
       
       <div className="flex items-center justify-between w-full mb-2">
@@ -368,7 +437,7 @@ const getForceLayoutedElements = (nodes: Node[], edges: Edge[]) => {
 // =========================================================
 // MAIN INTERACTIVE CANVAS
 // =========================================================
-function KnowledgeGraphFlowCanvas() {
+function KnowledgeGraphFlowCanvas({ onGoToUpload }: { onGoToUpload?: () => void }) {
   const reactFlowInstance = useReactFlow();
 
   const [stats, setStats] = useState<GraphStats | null>(null);
@@ -400,6 +469,44 @@ function KnowledgeGraphFlowCanvas() {
   const [query, setQuery] = useState("");
   const [queryLoading, setQueryLoading] = useState(false);
   const [queryResult, setQueryResult] = useState<GraphRAGResponse | null>(null);
+
+  // Lyzr Studio independent verifier
+  const [lyzrStatus, setLyzrStatus] = useState<{ configured: boolean; missing: string[] } | null>(null);
+  const [lyzrVerdict, setLyzrVerdict] = useState<LyzrVerdict | null>(null);
+  const [lyzrLoading, setLyzrLoading] = useState(false);
+  const [lyzrError, setLyzrError] = useState<string | null>(null);
+
+  useEffect(() => {
+    apiJson<{ configured: boolean; missing: string[] }>("/lyzr/status")
+      .then(setLyzrStatus)
+      .catch(() => setLyzrStatus({ configured: false, missing: ["unreachable"] }));
+  }, []);
+
+  const runLyzrVerification = async () => {
+    if (!queryResult) return;
+    setLyzrLoading(true);
+    setLyzrError(null);
+    setLyzrVerdict(null);
+    try {
+      const res = await apiJson<LyzrVerdict>("/lyzr/verify", {
+        method: "POST",
+        body: JSON.stringify({
+          question: queryResult.question,
+          answer: queryResult.answer,
+          // graph_context is only populated on the graph-traversal path; a
+          // vector-path answer carries its evidence in evidence_context. Sending
+          // the empty one made the verifier audit against nothing and return
+          // 100% hallucination risk for a correct answer.
+          graph_context: queryResult.graph_context || queryResult.evidence_context || "",
+        }),
+      });
+      setLyzrVerdict(res);
+    } catch (err: any) {
+      setLyzrError(err?.message || "Lyzr verification failed.");
+    } finally {
+      setLyzrLoading(false);
+    }
+  };
 
   const fetchGraphData = async () => {
     setLoading(true);
@@ -535,6 +642,13 @@ function KnowledgeGraphFlowCanvas() {
           aliases: n.aliases,
           degree: nodeDegrees[n.id] || 0,
           provenanceCount: n.provenance?.length || 1,
+          // Provenance carried onto the node so the hover card can surface
+          // source evidence without a round-trip (citation traceability).
+          documentId: n.document_id,
+          pageNumber: n.page_number,
+          chunkId: n.chunk_id,
+          sourceText: n.source_text || n.provenance?.[0]?.source_text,
+          documentCount: n.document_count,
           isHighlighted,
           isFaded,
         },
@@ -950,6 +1064,68 @@ function KnowledgeGraphFlowCanvas() {
                   <span className="text-sm font-semibold">Failed to load Knowledge Graph</span>
                   <span className="text-xs text-text-secondary mt-1">{error}</span>
                 </div>
+              ) : rawNodes.length === 0 ? (
+                <div className="absolute inset-0 z-20 flex items-center justify-center p-6 bg-[#090b11] overflow-y-auto">
+                  <div className="max-w-lg w-full text-center py-6">
+                    <div className="relative mx-auto w-fit mb-5">
+                      <div className="absolute inset-0 bg-accent/20 blur-2xl rounded-full" />
+                      <div className="relative p-4 bg-bg-secondary border border-border-default rounded-2xl">
+                        <NetworkIcon size={34} className="text-accent" />
+                      </div>
+                    </div>
+
+                    <h3 className="text-lg font-bold text-text-primary">Knowledge Graph is empty</h3>
+                    <p className="text-xs text-text-secondary mt-2 leading-relaxed max-w-sm mx-auto">
+                      Upload a compliance document and Kairo parses it, extracts the
+                      entity&ndash;relationship web, and synthesizes a fully traceable graph
+                      you can query with zero-hallucination Graph RAG.
+                    </p>
+
+                    <div className="flex items-center justify-center gap-1.5 mt-6 flex-wrap">
+                      {[
+                        { icon: FileText, label: "Parse" },
+                        { icon: Sparkles, label: "Extract Entities" },
+                        { icon: Share2, label: "Build Graph" },
+                        { icon: ShieldCheck, label: "Graph RAG" },
+                      ].map((s, i, arr) => (
+                        <React.Fragment key={s.label}>
+                          <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-bg-secondary border border-border-default rounded-lg">
+                            <s.icon size={12} className="text-accent" />
+                            <span className="text-[10px] font-semibold text-text-primary">{s.label}</span>
+                          </div>
+                          {i < arr.length - 1 && <ChevronRight size={12} className="text-text-secondary/50" />}
+                        </React.Fragment>
+                      ))}
+                    </div>
+
+                    <div className="mt-6">
+                      <p className="text-[10px] uppercase tracking-wider font-bold text-text-secondary mb-2.5">
+                        Compliance entities Kairo detects
+                      </p>
+                      <div className="flex flex-wrap items-center justify-center gap-1.5">
+                        {Object.entries(ENTITY_COLORS).map(([type, c]) => (
+                          <span
+                            key={type}
+                            className="flex items-center gap-1.5 px-2 py-1 bg-bg-secondary border border-border-default rounded-md"
+                          >
+                            <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: c.dot }} />
+                            <span className="text-[10px] text-text-secondary font-medium">{type}</span>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    {onGoToUpload && (
+                      <button
+                        onClick={onGoToUpload}
+                        className="mt-7 px-5 py-2.5 bg-accent text-white rounded-xl text-xs font-bold inline-flex items-center gap-2 hover:opacity-90 transition-opacity cursor-pointer shadow-lg shadow-accent/20"
+                      >
+                        <PlusCircle size={14} />
+                        Upload a compliance document
+                      </button>
+                    )}
+                  </div>
+                </div>
               ) : null}
 
               <ReactFlow
@@ -982,6 +1158,7 @@ function KnowledgeGraphFlowCanvas() {
               </ReactFlow>
 
               {/* DYNAMIC COLOR PALETTE LEGEND */}
+              {rawNodes.length > 0 && (
               <div className="absolute bottom-3 left-3 bg-bg-primary/95 border border-border-default rounded-xl p-3 backdrop-blur-md text-[10px] text-text-secondary flex flex-wrap items-center gap-4 max-w-[90%] pointer-events-none z-10 shadow-lg">
                 <span className="font-bold text-text-primary uppercase tracking-wider">Legend:</span>
                 {Object.entries(ENTITY_COLORS).map(([type, color]) => {
@@ -995,6 +1172,7 @@ function KnowledgeGraphFlowCanvas() {
                   );
                 })}
               </div>
+              )}
             </div>
           </div>
         </div>
@@ -1220,9 +1398,29 @@ function KnowledgeGraphFlowCanvas() {
                     <CheckCircle2 size={16} className="text-emerald-400" />
                     <span className="text-xs font-semibold text-text-primary">Graph RAG Response</span>
                   </div>
-                  <span className="text-[11px] px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 rounded-md font-mono">
-                    Confidence: {(queryResult.confidence * 100).toFixed(0)}%
-                  </span>
+                  <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                    {/* Only rendered once the Lyzr agent has actually returned a
+                        verdict, so the badge is evidence the audit ran — not
+                        decoration that shows up regardless. */}
+                    {lyzrVerdict && (
+                      <span
+                        className={`text-[10px] px-2 py-0.5 rounded-md font-mono font-bold border flex items-center gap-1 ${
+                          lyzrVerdict.verdict === "SUPPORTED"
+                            ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
+                            : lyzrVerdict.verdict === "UNSUPPORTED"
+                            ? "bg-rose-500/10 text-rose-400 border-rose-500/30"
+                            : "bg-indigo-500/10 text-indigo-300 border-indigo-500/30"
+                        }`}
+                        title={`Independently audited by Lyzr Studio agent ${lyzrVerdict.agent_id || ""}`}
+                      >
+                        <ShieldCheck size={10} />
+                        Lyzr Verified
+                      </span>
+                    )}
+                    <span className="text-[11px] px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 rounded-md font-mono">
+                      Confidence: {(queryResult.confidence * 100).toFixed(0)}%
+                    </span>
+                  </div>
                 </div>
 
                 <div className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap">
@@ -1256,6 +1454,112 @@ function KnowledgeGraphFlowCanvas() {
                     </div>
                   </div>
                 )}
+              </div>
+
+              {/* LYZR STUDIO — INDEPENDENT HALLUCINATION AUDIT */}
+              <div className="border border-indigo-500/25 rounded-xl p-4 bg-indigo-950/10 space-y-3">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <ShieldCheck size={16} className="text-indigo-400 shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-text-primary">
+                        Independent Verification
+                        <span className="ml-1.5 text-[9px] px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 font-mono uppercase tracking-wider">
+                          Lyzr Studio
+                        </span>
+                      </p>
+                      <p className="text-[10px] text-text-secondary mt-0.5">
+                        A separate agent re-checks this answer against the graph evidence only.
+                      </p>
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={runLyzrVerification}
+                    disabled={lyzrLoading || !lyzrStatus?.configured}
+                    className="px-3 py-1.5 bg-indigo-500 text-white rounded-lg text-[11px] font-bold flex items-center gap-1.5 hover:opacity-90 transition-opacity cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                  >
+                    {lyzrLoading ? <RefreshCw size={12} className="animate-spin" /> : <ShieldCheck size={12} />}
+                    {lyzrLoading ? "Auditing…" : "Verify answer"}
+                  </button>
+                </div>
+
+                {!lyzrStatus?.configured && (
+                  <p className="text-[10px] text-amber-400/90 bg-amber-500/10 border border-amber-500/25 rounded-lg px-2.5 py-2 font-mono">
+                    Lyzr verifier not configured{lyzrStatus?.missing?.length ? ` — missing ${lyzrStatus.missing.join(", ")}` : ""}. Set LYZR_API_KEY, LYZR_AGENT_ID and LYZR_USER_ID in Kairo/.env, then restart the backend.
+                  </p>
+                )}
+
+                {lyzrError && (
+                  <p className="text-[10px] text-rose-400 bg-rose-500/10 border border-rose-500/25 rounded-lg px-2.5 py-2 font-mono break-words">
+                    {lyzrError}
+                  </p>
+                )}
+
+                {lyzrVerdict && (() => {
+                  const tone =
+                    lyzrVerdict.verdict === "SUPPORTED"
+                      ? { text: "text-emerald-400", bg: "bg-emerald-500/10", border: "border-emerald-500/30", bar: "#10b981" }
+                      : lyzrVerdict.verdict === "PARTIALLY_SUPPORTED"
+                      ? { text: "text-amber-400", bg: "bg-amber-500/10", border: "border-amber-500/30", bar: "#f59e0b" }
+                      : lyzrVerdict.verdict === "UNSUPPORTED"
+                      ? { text: "text-rose-400", bg: "bg-rose-500/10", border: "border-rose-500/30", bar: "#f43f5e" }
+                      : { text: "text-text-secondary", bg: "bg-white/5", border: "border-border-default", bar: "#9ca3af" };
+                  const risk = lyzrVerdict.hallucination_risk;
+
+                  return (
+                    <div className="space-y-2.5 animate-in fade-in duration-200">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded border ${tone.text} ${tone.bg} ${tone.border}`}>
+                          {lyzrVerdict.verdict.replace(/_/g, " ")}
+                        </span>
+                        {risk !== null && (
+                          <span className="text-[10px] text-text-secondary font-mono">
+                            hallucination risk {risk}%
+                          </span>
+                        )}
+                        {!lyzrVerdict.parsed && (
+                          <span className="text-[9px] text-amber-400/80 font-mono">(unstructured agent reply)</span>
+                        )}
+                      </div>
+
+                      {risk !== null && (
+                        <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden">
+                          <div
+                            className="h-full rounded-full transition-all duration-500"
+                            style={{ width: `${Math.max(risk, 2)}%`, backgroundColor: tone.bar }}
+                          />
+                        </div>
+                      )}
+
+                      {lyzrVerdict.reasoning && (
+                        <p className="text-[11px] text-text-primary leading-relaxed">{lyzrVerdict.reasoning}</p>
+                      )}
+
+                      {lyzrVerdict.unsupported_claims?.length > 0 && (
+                        <div className="space-y-1 pt-1">
+                          <p className="text-[9px] uppercase tracking-wider font-bold text-text-secondary">
+                            Claims not supported by graph evidence
+                          </p>
+                          {lyzrVerdict.unsupported_claims.map((c, i) => (
+                            <p key={i} className="text-[10px] text-rose-300 bg-rose-500/5 border border-rose-500/20 rounded px-2 py-1 break-words">
+                              {c}
+                            </p>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Attribution: names the external service and the exact
+                          agent that produced this verdict, so the audit is
+                          itself traceable. */}
+                      <p className="text-[9px] text-text-secondary/70 font-mono pt-1.5 border-t border-white/10 flex items-center gap-1 flex-wrap">
+                        <ShieldCheck size={9} className="text-indigo-400" />
+                        Audited by Lyzr Studio
+                        {lyzrVerdict.agent_id && <span>&middot; agent {lyzrVerdict.agent_id}</span>}
+                      </p>
+                    </div>
+                  );
+                })()}
               </div>
 
               {showDebugPanel && queryResult.debug_info && (
@@ -1381,10 +1685,10 @@ function KnowledgeGraphFlowCanvas() {
   );
 }
 
-export default function KnowledgeGraphView() {
+export default function KnowledgeGraphView({ onGoToUpload }: { onGoToUpload?: () => void }) {
   return (
     <ReactFlowProvider>
-      <KnowledgeGraphFlowCanvas />
+      <KnowledgeGraphFlowCanvas onGoToUpload={onGoToUpload} />
     </ReactFlowProvider>
   );
 }

@@ -736,7 +736,7 @@ export default function AdminPage() {
 
                         {/* TAB 1.5: Knowledge Graph Synthesis */}
                         {activeTab === 'graph' && (
-                            <KnowledgeGraphView />
+                            <KnowledgeGraphView onGoToUpload={() => setActiveTab('documents')} />
                         )}
 
                         {/* TAB 2: Support Tickets (Interactive Table) */}
